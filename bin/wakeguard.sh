@@ -8,10 +8,11 @@ CONFIG_FILE="${XDG_CONFIG_HOME:-${HOME:-}/.config}/wakeguard/config"
 
 usage() {
   cat <<'USAGE'
-Usage: wakeguard.sh <start|stop|reap|status>
+Usage: wakeguard.sh <start|stop|end|reap|status>
 
   start   Launch a detached sleep-inhibiting holder for this session.
-  stop    Kill the holder recorded for this session.
+  stop    Kill the holder recorded for this session's turn.
+  end     Kill every holder this session recorded.
   reap    Kill holders that no live session can still release.
   status  Print every recorded holder and what state it is in.
 
@@ -533,6 +534,23 @@ cmd_stop() {
   release_pidfile "$pidfile" "stop session=$session_id" || true
 }
 
+# Everything this session recorded, not just its turn holder. Subagent holders
+# outlive the turn that started them on purpose, so only the end of the session
+# may sweep them up.
+cmd_end() {
+  local session_id="$1" pidfile
+
+  for pidfile in "$SESSIONS_DIR/$session_id".*.pid "$(pidfile_path "$session_id")"; do
+    [ -e "$pidfile" ] || continue
+    if ! read_pidfile "$pidfile"; then
+      log "end $(pidfile_session "$pidfile"): no holder pid recorded"
+      rm -f "$pidfile" 2>/dev/null || true
+      continue
+    fi
+    release_pidfile "$pidfile" "end $(pidfile_session "$pidfile")" || true
+  done
+}
+
 # Prints why a holder can no longer be released by the session that started it,
 # or nothing when the pidfile still describes a working session.
 reap_reason() {
@@ -676,7 +694,7 @@ main() {
   local subcommand="${1:-}" session_id
 
   case "$subcommand" in
-    start|stop)
+    start|stop|end)
       # A failed suppression must never break the user's turn.
       trap 'exit 0' EXIT
       load_config

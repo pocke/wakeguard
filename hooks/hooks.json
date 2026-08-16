@@ -38,8 +38,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/wakeguard.sh\" stop",
-            "timeout": 30
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/wakeguard.sh\" end",
+            "timeout": 60
           }
         ]
       }
