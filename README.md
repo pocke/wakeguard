@@ -1,5 +1,7 @@
 # wakeguard
 
+[日本語](README.ja.md)
+
 Keeps your machine awake while Claude Code is working on a turn, and lets it
 sleep again as soon as the turn ends. Neither an idle session nor a crashed one
 stands in the way of sleep.
@@ -105,7 +107,7 @@ new version treat it as somebody else's process. Such a holder is left to its
 
 `systemd-inhibit --what=idle` blocks logind's own `IdleAction`. A desktop
 environment that runs its own idle timer — GNOME and KDE both do — suspends
-without consulting it, so the fallback may not hold on a full desktop.
+without consulting it, so the fallback does not hold there.
 
 ## Out of scope
 
