@@ -8,10 +8,11 @@ CONFIG_FILE="${XDG_CONFIG_HOME:-${HOME:-}/.config}/wakeguard/config"
 
 usage() {
   cat <<'USAGE'
-Usage: wakeguard.sh <start|stop|status>
+Usage: wakeguard.sh <start|stop|reap|status>
 
   start   Launch a detached sleep-inhibiting holder for this session.
   stop    Kill the holder recorded for this session.
+  reap    Kill holders that no live session can still release.
   status  Print every recorded holder and what state it is in.
 
 Hook events feed the session id on stdin as JSON.
@@ -519,6 +520,129 @@ cmd_stop() {
   rm -f "$pidfile" 2>/dev/null || true
 }
 
+# Prints why a holder can no longer be released by the session that started it,
+# or nothing when the pidfile still describes a working session.
+reap_reason() {
+  local state="$1" age
+
+  case "$state" in
+    gone|foreign) printf 'the holder is %s' "$state"; return 0 ;;
+  esac
+
+  # After a reboot, and after `wsl --shutdown` in particular, pids restart from
+  # small numbers, so a recorded CLAUDE_PID almost certainly lands on some
+  # unrelated live process.
+  if [ -n "$BOOT_ID" ] && [ "$BOOT_ID" != "$(boot_id)" ]; then
+    printf 'recorded before the current boot'
+    return 0
+  fi
+
+  if [ -n "$CLAUDE_PID" ] && ! kill -0 "$CLAUDE_PID" 2>/dev/null; then
+    printf 'claude pid %s is gone' "$CLAUDE_PID"
+    return 0
+  fi
+
+  case "$STARTED_AT" in
+    ''|*[!0-9]*) printf 'STARTED_AT is unusable'; return 0 ;;
+  esac
+  age=$(( $(date '+%s') - 10#$STARTED_AT ))
+  if [ "$age" -gt "$(max_hours_seconds)" ]; then
+    printf 'alive for %ss, past the %sh limit' "$age" "$WAKEGUARD_MAX_HOURS"
+  fi
+}
+
+cmd_reap() {
+  local pidfile session state reason outcome
+  local windows_pids='' unix_pids=''
+
+  for pidfile in "$SESSIONS_DIR"/*.pid; do
+    [ -e "$pidfile" ] || continue
+    session="$(pidfile_session "$pidfile")"
+
+    if ! read_pidfile "$pidfile"; then
+      log "reaping $session: no holder pid recorded"
+      rm -f "$pidfile" 2>/dev/null || true
+      continue
+    fi
+
+    state="$(holder_state)"
+    reason="$(reap_reason "$state")"
+    if [ -n "$reason" ]; then
+      outcome="$(holder_release)"
+      log "reaping $session: $reason ($outcome)"
+      if [ "$outcome" != unknown ]; then
+        rm -f "$pidfile" 2>/dev/null || true
+        continue
+      fi
+    fi
+
+    if holder_is_windows; then
+      windows_pids="$windows_pids $HOLDER_PID"
+    else
+      unix_pids="$unix_pids $HOLDER_PID"
+    fi
+  done
+
+  sweep_unrecorded_windows "$windows_pids"
+  sweep_unrecorded_systemd "$unix_pids"
+}
+
+# A holder started by a hook that was killed before it could write its pidfile
+# is invisible to every path above, and nothing is left that would ever release
+# it. Kill the holders this machine is running that no pidfile claims.
+#
+# Every sweep skips holders younger than SWEEP_MIN_AGE_SECONDS. Walking the
+# pidfiles costs an interop round trip each, and a session that starts during
+# that walk would otherwise look unrecorded and lose its holder mid-turn. An
+# orphan is in no hurry: it carries its own deadline.
+SWEEP_MIN_AGE_SECONDS=120
+
+sweep_unrecorded_windows() {
+  local recorded="$1" ps1_win script pid
+
+  ps1_win="$(holder_script_winpath)" || return 0
+  script="$(cat <<'POWERSHELL'
+$keep = @(__WG_KEEP__)
+$cutoff = (Get-Date).AddSeconds(-__WG_MIN_AGE__)
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+  Where-Object { $_.CommandLine -and $_.CommandLine.Contains(__WG_SCRIPT__) -and
+                 $_.CreationDate -lt $cutoff -and
+                 $keep -notcontains $_.ProcessId } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }
+POWERSHELL
+  )"
+  # The replacement is quoted so bash 5.2 does not read a & in the path as
+  # "insert the match here".
+  script="${script//__WG_SCRIPT__/"'$ps1_win'"}"
+  script="${script//__WG_KEEP__/"$(pid_list_to_csv "$recorded")"}"
+  script="${script//__WG_MIN_AGE__/$SWEEP_MIN_AGE_SECONDS}"
+
+  # Killed in the same trip that finds them.
+  for pid in $(powershell_eval "$script" | grep -E '^[0-9]+$'); do
+    log "swept unrecorded windows holder pid=$pid"
+  done
+}
+
+sweep_unrecorded_systemd() {
+  local recorded="$1" pid age
+
+  for pid in $(pgrep -f -- '--who=wakeguard' 2>/dev/null); do
+    case " $recorded " in *" $pid "*) continue ;; esac
+    # pgrep -f matches any command line carrying that text, including a shell
+    # that merely mentions it.
+    [ "$(process_command "$pid")" = systemd-inhibit ] || continue
+    age="$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')"
+    case "$age" in ''|*[!0-9]*) continue ;; esac
+    [ "$age" -ge "$SWEEP_MIN_AGE_SECONDS" ] || continue
+    kill "$pid" 2>/dev/null || true
+    log "swept unrecorded systemd-inhibit pid=$pid"
+  done
+}
+
+pid_list_to_csv() {
+  printf '%s' "$1" | tr -s ' ' ',' | sed 's/^,//;s/,$//'
+}
+
 cmd_status() {
   local pidfile found=0 state
 
@@ -558,6 +682,12 @@ main() {
           ;;
       esac
       "cmd_$subcommand" "$session_id"
+      ;;
+    reap)
+      trap 'exit 0' EXIT
+      load_config
+      drain_stdin >/dev/null
+      cmd_reap
       ;;
     status)
       load_config
