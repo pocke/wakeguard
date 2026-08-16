@@ -8,6 +8,8 @@ Claude Code がターンを処理している間だけ PC をスリープさせ�
 
 ## 導入
 
+Claude Code のセッション内のプロンプトに打ち込む。
+
 ```
 /plugin marketplace add pocke/wakeguard
 /plugin install wakeguard@wakeguard
