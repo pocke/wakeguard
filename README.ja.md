@@ -29,10 +29,12 @@ Claude Code のセッション内のプロンプトに打ち込む。
 1 セッションにつき、フックから切り離した抑制ホルダープロセスを 1 個立て、参照カウントは OS に任せる。ホルダーが 1 個でも生きていれば PC は寝ないので、複数のセッションが同時に動いていても共有のカウンタは要らない。抑制の解除はホルダーを kill するだけ。
 
 ```
-UserPromptSubmit  ->  wakeguard.sh start   ホルダーを起動し pidfile に記録する
-Stop, StopFailure ->  wakeguard.sh stop    ホルダーを kill し pidfile を消す
-SessionEnd        ->  wakeguard.sh stop
-SessionStart      ->  wakeguard.sh reap    取り残されたホルダーを片付ける
+UserPromptSubmit  ->  wakeguard.sh start        ホルダーを起動し pidfile に記録する
+Stop, StopFailure ->  wakeguard.sh stop         そのターンのホルダーを kill する
+SubagentStart     ->  wakeguard.sh agent-start  サブエージェント用のホルダーを起動する
+SubagentStop      ->  wakeguard.sh agent-stop   そのサブエージェントのホルダーを kill する
+SessionEnd        ->  wakeguard.sh end          このセッションのホルダーを全部 kill する
+SessionStart      ->  wakeguard.sh reap         取り残されたホルダーを片付ける
 ```
 
 環境ごとのホルダーは次のとおり。
@@ -46,7 +48,9 @@ SessionStart      ->  wakeguard.sh reap    取り残されたホルダーを片�
 
 WSL2 の内部で抑制しても意味がない。Windows ホストはスリープするとき VM ごとサスペンドするため。だから WSL2 でも必ずホスト側にホルダーを置く。
 
-pidfile は `${XDG_STATE_HOME:-~/.local/state}/wakeguard/sessions/` に置く。
+サブエージェントは、それを起動したターンが終わったあとも走り続ける。だからサブエージェント 1 つにつき別のホルダーを立て、`SubagentStop` が来るまで生かしておく。レビューや調査をサブエージェントに投げて結果を待っている間も PC は眠らない。
+
+pidfile は `${XDG_STATE_HOME:-~/.local/state}/wakeguard/sessions/` に置く。ターン用が `<session_id>.pid`、サブエージェント用が `<session_id>.<agent_id>.pid`。
 
 ## 設定
 
@@ -80,7 +84,8 @@ OS 側から抑制を確認するなら、ターンの実行中に次を実行�
 | 終わり方 | 解除する仕組み |
 |---|---|
 | ターンが正常終了するか API エラーで終わる | `Stop` / `StopFailure` フック |
-| exit や Ctrl-C でセッションが終わる | `SessionEnd` フック |
+| exit や Ctrl-C でセッションが終わる | `SessionEnd` フック。このセッションのホルダーを、サブエージェント用も含めて全部片付ける |
+| サブエージェントが終わる | `SubagentStop` フック |
 | Claude Code が kill された・クラッシュした | macOS では `caffeinate -w` が Claude Code と一緒に終了する。どの OS でも、次の `SessionStart` の reap が死んだ PID に気づく |
 | ホルダーを記録する前にフックが kill された | 次の `SessionStart` の reap が、どの pidfile からも参照されていないホルダーをまとめて片付ける (Windows と Linux のみ)。macOS にはこの片付けがない。`caffeinate` には wakeguard 由来かどうかを見分ける目印を付けられないので、記録されなかったものは `caffeinate -w` と `-t` の期限に委ねる |
 | フックが 1 つも発火しない | ホルダー自身が持つ `WAKEGUARD_MAX_HOURS` の期限。ただし `WAKEGUARD_CMD` のホルダーには期限が付かず、1 つ上の行の片付けの対象にもならない。任意のコマンドに期限を渡す方法がなく、wakeguard が名前を知らないプロセスを自分のものと判別する方法もないため |
@@ -88,7 +93,7 @@ OS 側から抑制を確認するなら、ターンの実行中に次を実行�
 
 kill する前に、記録した PID が本当に自分が起動したホルダーかどうかを毎回確認する。Unix ではコマンド名で、Windows ではコマンドラインに含まれるホルダースクリプトのパスで判定する。PID が再利用されていても無関係なプロセスを kill することはない。
 
-**把握しておくべき穴が 2 つある。** Esc でターンを中断しても `Stop` は発火しないので、ホルダーは次のターンが終わるかセッションが終わるまで残る。それまで PC は自分からは眠らない。
+**把握しておくべき穴が 2 つある。** Esc でターンを中断しても `Stop` は発火しないので、ホルダーは次のターンが終わるかセッションが終わるまで残る。それまで PC は自分からは眠らない。サブエージェントごと中断した場合に `SubagentStop` が届くかは未確認で、届かなければサブエージェント用のホルダーも同じだけ残る。
 
 もう 1 つ。Windows ホルダーの判別に使うホルダースクリプトのパスにはプラグインのバージョンが含まれる。ホルダーが動いている最中にプラグインを更新すると、新しいバージョンからは wakeguard 以外が起動したプロセスに見えて、kill の対象から外れる。そうなったホルダーは `WAKEGUARD_MAX_HOURS` の期限まで残る。
 
@@ -98,4 +103,6 @@ kill する前に、記録した PID が本当に自分が起動したホルダ�
 
 ## スコープ外
 
-バックグラウンドタスク。その完了を知らせるフックがなく、対応すると抑制を解除し損ねる経路が増えるため。
+**`Bash` のバックグラウンド実行**。完了を確実に知らせるフックがなく、対応すると抑制を解除できないまま残す経路が増えるため。
+
+**`TaskCreated` / `TaskCompleted`**。これはタスクリストへの書き込みと完了のイベントで、何かが走り始めた・終わったことを表さない。抑制のきっかけには使えない。
