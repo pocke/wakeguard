@@ -18,6 +18,21 @@ Type these at the prompt inside a Claude Code session:
 /plugin install wakeguard@wakeguard
 ```
 
+## What it needs
+
+What the repository holds is what runs. Nothing is built or fetched beyond the
+repository itself, and no runtime is added.
+
+- **Everywhere**: `bash` and the basic Unix commands — `grep`, `sed`, `awk`,
+  `ps` and the like; on Windows they come with Git Bash.
+- **Windows and WSL2, on top of that**: Windows PowerShell 5.1, which ships
+  with Windows. No extra modules. WSL2 reaches it over interop and converts
+  paths with `wslpath`; Git Bash uses `cygpath`.
+
+Suppressing sleep is left to what the OS already offers: `caffeinate` on
+macOS, `systemd-inhibit` on Linux, and `SetThreadExecutionState` through
+PowerShell on Windows and WSL2.
+
 ## How it works
 
 One session gets one detached holder process, and the reference counting is left
