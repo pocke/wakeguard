@@ -154,13 +154,20 @@ drain_stdin() {
   cat
 }
 
-session_id_from() {
-  local id
-  id="$(printf '%s' "$1" |
-    LC_ALL=C grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' |
+# Reads one string field out of the hook's JSON. The key goes into the pattern
+# unescaped, so pass a literal word. Matching it together with its quotes is
+# what keeps "agent_type" from answering for "agent_id".
+#
+# The answer is reduced to characters that are safe in a filename, and the dot
+# is not among them: ids are joined with one to name a subagent's pidfile, so a
+# dot inside an id would make two different pairs share a name.
+json_string_field() {
+  local json="$1" key="$2" value
+  value="$(printf '%s' "$json" |
+    LC_ALL=C grep -o "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" |
     head -n 1 |
     LC_ALL=C sed 's/.*"\([^"]*\)"$/\1/')"
-  printf '%s' "$id" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_'
+  printf '%s' "$value" | LC_ALL=C tr -c 'A-Za-z0-9_-' '_'
 }
 
 # --- pidfile ----------------------------------------------------------------
@@ -673,7 +680,7 @@ main() {
       # A failed suppression must never break the user's turn.
       trap 'exit 0' EXIT
       load_config
-      session_id="$(session_id_from "$(drain_stdin)")"
+      session_id="$(json_string_field "$(drain_stdin)" session_id)"
       case "$session_id" in
         ''|.|..)
           # Without a stable id, start and stop can never find each other and
