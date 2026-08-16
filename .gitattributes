@@ -1,0 +1,7 @@
+* text=auto eol=lf
+
+# A .sh checked out with CRLF gets `bash\r` as its shebang, and every hook dies
+# with "bad interpreter" on Windows.
+*.sh text eol=lf
+
+*.ps1 text eol=crlf
