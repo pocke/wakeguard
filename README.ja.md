@@ -15,6 +15,15 @@ Claude Code のセッション内のプロンプトに打ち込む。
 /plugin install wakeguard@wakeguard
 ```
 
+## 必要なもの
+
+リポジトリに入っているものがそのまま動く。リポジトリを取ってくる以外にビルドもダウンロードも起きないし、追加のランタイムも要らない。
+
+- **どの環境でも**: `bash` と基本的な Unix コマンド (`grep`、`sed`、`awk`、`ps` など)。Windows ではこれらは Git Bash に付いてくる
+- **Windows と WSL2 では、これに加えて**: Windows に同梱の Windows PowerShell 5.1。追加のモジュールも要らない。WSL2 は interop 経由で呼び、パスの変換に `wslpath` を使う。Git Bash は `cygpath` を使う
+
+スリープの抑制そのものは、OS が既に持っている仕組みに任せる。macOS なら `caffeinate`、Linux なら `systemd-inhibit`、Windows と WSL2 なら PowerShell 経由の `SetThreadExecutionState`。
+
 ## 仕組み
 
 1 セッションにつき、フックから切り離した抑制ホルダープロセスを 1 個立て、参照カウントは OS に任せる。ホルダーが 1 個でも生きていれば PC は寝ないので、複数のセッションが同時に動いていても共有のカウンタは要らない。抑制の解除はホルダーを kill するだけ。
