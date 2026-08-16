@@ -8,15 +8,18 @@ CONFIG_FILE="${XDG_CONFIG_HOME:-${HOME:-}/.config}/wakeguard/config"
 
 usage() {
   cat <<'USAGE'
-Usage: wakeguard.sh <start|stop|end|reap|status>
+Usage: wakeguard.sh <start|stop|end|agent-start|agent-stop|reap|status>
 
-  start   Launch a detached sleep-inhibiting holder for this session.
-  stop    Kill the holder recorded for this session's turn.
-  end     Kill every holder this session recorded.
-  reap    Kill holders that no live session can still release.
-  status  Print every recorded holder and what state it is in.
+  start        Launch a detached sleep-inhibiting holder for this session.
+  stop         Kill the holder recorded for this session's turn.
+  end          Kill every holder this session recorded.
+  agent-start  Launch a holder for one subagent, which outlives the turn.
+  agent-stop   Kill the holder recorded for one subagent.
+  reap         Kill holders that no live session can still release.
+  status       Print every recorded holder and what state it is in.
 
-Hook events feed the session id on stdin as JSON.
+Hook events feed the session id, and for agent-* the agent id, on stdin
+as JSON.
 USAGE
 }
 
@@ -690,24 +693,47 @@ cmd_status() {
   [ "$found" = 1 ] || printf 'no holders recorded\n'
 }
 
+# An id that can name a pidfile. "." and ".." would name the directory itself.
+usable_id() {
+  case "${1:-}" in
+    ''|.|..) return 1 ;;
+  esac
+  return 0
+}
+
 main() {
-  local subcommand="${1:-}" session_id
+  local subcommand="${1:-}" input session_id agent_id
 
   case "$subcommand" in
-    start|stop|end)
+    start|stop|end|agent-start|agent-stop)
       # A failed suppression must never break the user's turn.
       trap 'exit 0' EXIT
       load_config
-      session_id="$(json_string_field "$(drain_stdin)" session_id)"
-      case "$session_id" in
-        ''|.|..)
-          # Without a stable id, start and stop can never find each other and
-          # every turn would leave one more holder behind.
-          log "no session id in the hook input, doing nothing"
-          return 0
+      input="$(drain_stdin)"
+
+      session_id="$(json_string_field "$input" session_id)"
+      if ! usable_id "$session_id"; then
+        # Without a stable id, start and stop can never find each other and
+        # every turn would leave one more holder behind.
+        log "no session id in the hook input, doing nothing"
+        return 0
+      fi
+
+      case "$subcommand" in
+        agent-*)
+          agent_id="$(json_string_field "$input" agent_id)"
+          if ! usable_id "$agent_id"; then
+            # The name would collapse to the session's own pidfile, and this
+            # subagent's stop would then kill the turn's holder.
+            log "no agent id in the hook input, doing nothing"
+            return 0
+          fi
+          "cmd_${subcommand#agent-}" "$session_id.$agent_id"
+          ;;
+        *)
+          "cmd_$subcommand" "$session_id"
           ;;
       esac
-      "cmd_$subcommand" "$session_id"
       ;;
     reap)
       trap 'exit 0' EXIT
