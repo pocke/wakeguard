@@ -11,6 +11,8 @@ fallback.
 
 ## Install
 
+Type these at the prompt inside a Claude Code session:
+
 ```
 /plugin marketplace add pocke/wakeguard
 /plugin install wakeguard@wakeguard
