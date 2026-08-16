@@ -91,6 +91,60 @@ detect_env() {
   esac
 }
 
+# --- Windows interop --------------------------------------------------------
+
+to_winpath() {
+  if command -v wslpath >/dev/null 2>&1; then
+    wslpath -w "$1" 2>/dev/null
+  elif command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$1" 2>/dev/null
+  fi
+}
+
+# CLAUDE_PLUGIN_ROOT can reach a Windows bash as a Windows path, and dirname
+# then answers "." for it.
+to_unixpath() {
+  case "$1" in
+    ?:\\*|?:/*|\\\\*)
+      if command -v cygpath >/dev/null 2>&1; then
+        cygpath -u "$1" 2>/dev/null
+      elif command -v wslpath >/dev/null 2>&1; then
+        wslpath -u "$1" 2>/dev/null
+      fi
+      ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+holder_script() {
+  local self dir
+  self="$(to_unixpath "$0")"
+  dir="$(cd -- "$(dirname -- "$self")" 2>/dev/null && pwd)" || return 1
+  printf '%s/wakeguard-hold.ps1' "$dir"
+}
+
+powershell_bin() {
+  if command -v powershell.exe >/dev/null 2>&1; then
+    printf 'powershell.exe'
+    return 0
+  fi
+  # interop.appendWindowsPath=false keeps powershell.exe off PATH without
+  # disabling interop itself.
+  local fallback
+  fallback="$(wslpath -u 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' 2>/dev/null)"
+  [ -n "$fallback" ] && [ -x "$fallback" ] || return 1
+  printf '%s' "$fallback"
+}
+
+powershell_eval() {
+  local bin
+  bin="$(powershell_bin)" || return 1
+  # MSYS rewrites arguments that look like paths on the way to a Windows
+  # binary, which would mangle the script text.
+  MSYS2_ARG_CONV_EXCL='*' "$bin" -NoProfile -ExecutionPolicy Bypass \
+    -Command "$1" 2>/dev/null | tr -d '\r'
+}
+
 # --- hook input -------------------------------------------------------------
 
 drain_stdin() {
@@ -248,6 +302,9 @@ start_holder() {
   case "$HOLDER_ENV" in
     macos) start_holder_macos "$claude_pid" ;;
     linux) start_holder_systemd ;;
+    # Not a typo for wsl: a suppression inside the VM is pointless because the
+    # Windows host suspends the VM along with itself.
+    wsl|winbash) start_holder_windows ;;
     *)
       log "no holder available for env=$HOLDER_ENV"
       return 1
@@ -279,6 +336,41 @@ start_holder_systemd() {
   HOLDER_KIND=systemd-inhibit
 }
 
+start_holder_windows() {
+  local ps1 ps1_win arglist pid
+
+  ps1="$(holder_script)" && [ -r "$ps1" ] ||
+    { log "holder script not found next to $0"; return 1; }
+  ps1_win="$(holder_script_winpath)" ||
+    { log "cannot convert to a Windows path: $ps1"; return 1; }
+
+  # Start-Process joins -ArgumentList with spaces and quotes nothing, so the
+  # path brings its own quotes to survive a user name like "John Doe".
+  arglist="'-NoProfile','-ExecutionPolicy','Bypass','-File','\"$ps1_win\"'"
+  arglist="$arglist,'-TimeoutHours','$WAKEGUARD_MAX_HOURS'"
+  [ "$WAKEGUARD_DISPLAY" = 1 ] && arglist="$arglist,'-KeepDisplayOn'"
+
+  # Anything but a bare number is interop noise such as the UNC working
+  # directory warning.
+  pid="$(powershell_eval \
+    "(Start-Process powershell -ArgumentList $arglist -WindowStyle Hidden -PassThru).Id" |
+    grep -E '^[0-9]+$' | tail -n 1)"
+  is_pid "$pid" || { log 'Start-Process returned no pid'; return 1; }
+
+  HOLDER_PID="$pid"
+  HOLDER_KIND=powershell
+}
+
+# The Windows path of the holder script, escaped for a PowerShell single-quoted
+# string.
+holder_script_winpath() {
+  local ps1 win
+  ps1="$(holder_script)" || return 1
+  win="$(to_winpath "$ps1")"
+  [ -n "$win" ] || return 1
+  printf '%s' "${win//\'/\'\'}"
+}
+
 start_holder_custom() {
   local -a cmd
   read -r -a cmd <<<"$WAKEGUARD_CMD"
@@ -298,8 +390,18 @@ start_holder_custom() {
 #   gone     no such process
 #   unknown  the question could not be answered
 
+# A powershell holder's pid is a Windows pid, unusable with kill(2) even when
+# wakeguard.sh itself runs under WSL2.
+holder_is_windows() {
+  [ "$HOLDER_KIND" = powershell ]
+}
+
 holder_state() {
-  unix_holder_state
+  if holder_is_windows; then
+    windows_holder_probe ''
+  else
+    unix_holder_state
+  fi
 }
 
 unix_holder_state() {
@@ -323,12 +425,44 @@ unix_holder_state() {
   fi
 }
 
+# Every powershell.exe on the machine answers to ProcessName "powershell", so
+# only the holder script in its command line tells ours apart from a session
+# the user opened. Answering in the same trip that kills keeps stop down to one
+# interop round trip, which costs several hundred milliseconds.
+windows_holder_probe() {
+  local action="$1" ps1_win script out
+
+  is_pid "$HOLDER_PID" || { printf unknown; return; }
+  # An empty needle would make Contains match every powershell on the machine.
+  ps1_win="$(holder_script_winpath)" || { printf unknown; return; }
+
+  script='$p = Get-CimInstance Win32_Process -Filter "ProcessId=__WG_PID__"
+if (-not $p) { "gone" }
+elseif ($p.CommandLine -and $p.CommandLine.Contains(__WG_SCRIPT__)) { __WG_ACTION__ }
+else { "foreign" }'
+  script="${script//__WG_ACTION__/${action:-\"ours\"}}"
+  # The replacement is quoted so bash 5.2 does not read a & in the path as
+  # "insert the match here".
+  script="${script//__WG_SCRIPT__/"'$ps1_win'"}"
+  script="${script//__WG_PID__/$HOLDER_PID}"
+
+  out="$(powershell_eval "$script" | grep -E '^(ours|killed|foreign|gone)$' | head -n 1)"
+  printf '%s' "${out:-unknown}"
+}
+
 # Kills the holder when it is still ours, and reports what happened using the
 # same vocabulary as holder_state, with "killed" in place of "ours".
 holder_release() {
   local state
-  state="$(unix_holder_state)"
 
+  if holder_is_windows; then
+    # -ErrorAction Stop: without it a refused Stop-Process is non-terminating
+    # and "killed" would be reported for a holder that is still running.
+    windows_holder_probe 'Stop-Process -Id __WG_PID__ -Force -ErrorAction Stop; "killed"'
+    return
+  fi
+
+  state="$(unix_holder_state)"
   [ "$state" = ours ] || { printf '%s' "$state"; return; }
   kill "$HOLDER_PID" 2>/dev/null || true
   printf killed
