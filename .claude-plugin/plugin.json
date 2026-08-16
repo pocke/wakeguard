@@ -10,5 +10,6 @@
   },
   "homepage": "https://github.com/pocke/wakeguard",
   "repository": "https://github.com/pocke/wakeguard",
+  "license": "MIT",
   "keywords": ["sleep", "caffeinate", "macos", "windows", "wsl"]
 }
