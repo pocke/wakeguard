@@ -502,22 +502,28 @@ cmd_start() {
   log "started holder pid=$HOLDER_PID kind=$HOLDER_KIND session=$session_id"
 }
 
+# Releases the holder that read_pidfile has already loaded, then drops the
+# pidfile. Fails, and keeps the pidfile, when the holder's fate could not be
+# determined: the pidfile is the only way back to it.
+release_pidfile() {
+  local pidfile="$1" label="$2" outcome
+
+  outcome="$(holder_release)"
+  log "$label holder=$HOLDER_PID kind=$HOLDER_KIND: $outcome"
+  [ "$outcome" != unknown ] || return 1
+  rm -f "$pidfile" 2>/dev/null || true
+}
+
 cmd_stop() {
-  local session_id="$1" pidfile outcome
+  local session_id="$1" pidfile
   pidfile="$(pidfile_path "$session_id")"
 
   if ! read_pidfile "$pidfile"; then
+    log "stop session=$session_id: no holder pid recorded"
     rm -f "$pidfile" 2>/dev/null || true
     return 0
   fi
-
-  outcome="$(holder_release)"
-  log "stop session=$session_id holder=$HOLDER_PID kind=$HOLDER_KIND: $outcome"
-
-  # The pidfile is the only way back to the holder, so it survives an outcome
-  # that leaves the holder's fate open.
-  [ "$outcome" = unknown ] && return 0
-  rm -f "$pidfile" 2>/dev/null || true
+  release_pidfile "$pidfile" "stop session=$session_id" || true
 }
 
 # Prints why a holder can no longer be released by the session that started it,
@@ -552,7 +558,7 @@ reap_reason() {
 }
 
 cmd_reap() {
-  local pidfile session state reason outcome
+  local pidfile session state reason
   local windows_pids='' unix_pids=''
 
   for pidfile in "$SESSIONS_DIR"/*.pid; do
@@ -568,12 +574,7 @@ cmd_reap() {
     state="$(holder_state)"
     reason="$(reap_reason "$state")"
     if [ -n "$reason" ]; then
-      outcome="$(holder_release)"
-      log "reaping $session: $reason ($outcome)"
-      if [ "$outcome" != unknown ]; then
-        rm -f "$pidfile" 2>/dev/null || true
-        continue
-      fi
+      release_pidfile "$pidfile" "reaping $session ($reason)" && continue
     fi
 
     if holder_is_windows; then
