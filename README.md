@@ -53,7 +53,7 @@ the file.
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `WAKEGUARD_CMD` | Run this command as the holder instead of the one picked by environment detection, e.g. `caffeinate -dims` | unset |
+| `WAKEGUARD_CMD` | Run this command as the holder instead of the one picked by environment detection, e.g. `caffeinate -dims`. Split on whitespace, so quoting an argument does not work | unset |
 | `WAKEGUARD_DISPLAY` | `1` keeps the display on as well (`caffeinate -d` / `-KeepDisplayOn`). No effect on Linux | `0` |
 | `WAKEGUARD_MAX_HOURS` | How long a holder may live before it gives up on its own. A number in [0.001, 168]; anything else falls back to the default | `8` |
 | `WAKEGUARD_LOG` | Append diagnostics to this file. Nothing is written anywhere without it, so set it first when wakeguard seems to be doing nothing | unset |

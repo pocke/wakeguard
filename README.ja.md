@@ -43,7 +43,7 @@ pidfile は `${XDG_STATE_HOME:-~/.local/state}/wakeguard/sessions/` に置く。
 
 | 変数 | 意味 | 既定値 |
 |---|---|---|
-| `WAKEGUARD_CMD` | 環境判定で選ばれるホルダーの代わりに、このコマンドをホルダーとして起動する (例: `caffeinate -dims`) | 未設定 |
+| `WAKEGUARD_CMD` | 環境判定で選ばれるホルダーの代わりに、このコマンドをホルダーとして起動する (例: `caffeinate -dims`)。空白で区切るので、引数をクォートでまとめることはできない | 未設定 |
 | `WAKEGUARD_DISPLAY` | `1` にするとディスプレイも点けたままにする (`caffeinate -d` / `-KeepDisplayOn`)。Linux では効かない | `0` |
 | `WAKEGUARD_MAX_HOURS` | ホルダーが自分から終了するまでの上限時間。[0.001, 168] の数値で、それ以外を書くと既定値に戻る | `8` |
 | `WAKEGUARD_LOG` | 診断メッセージをこのファイルに追記する。設定しない限りログはどこにも出ないので、wakeguard が効いていないと感じたらまずこれを設定する | 未設定 |
