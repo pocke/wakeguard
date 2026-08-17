@@ -142,6 +142,14 @@ powershell_bin() {
   printf '%s' "$fallback"
 }
 
+# Puts $3 where $1 first says $2. ${text//name/value} cannot do this across the
+# bash versions wakeguard runs on: 5.2 reads a & in the value as the text that
+# matched, and 3.2 keeps quotes meant to stop it.
+fill_in() {
+  local text="$1" name="$2" value="$3"
+  printf '%s%s%s' "${text%%"$name"*}" "$value" "${text#*"$name"}"
+}
+
 powershell_eval() {
   local bin
   bin="$(powershell_bin)" || return 1
@@ -574,12 +582,10 @@ foreach ($id in @(__WG_PIDS__)) {
 }
 POWERSHELL
   )"
-  # The replacements are quoted so bash 5.2 does not read a & in them as
-  # "insert the match here".
-  script="${script//__WG_ACTION__/"${action:-\"\$id ours\"}"}"
-  script="${script//__WG_SCRIPT__/"'$ps1_win'"}"
-  script="${script//__WG_FILTER__/"$filter"}"
-  script="${script//__WG_PIDS__/"$(pid_list_to_csv "$pids")"}"
+  script="$(fill_in "$script" __WG_ACTION__ "${action:-\"\$id ours\"}")"
+  script="$(fill_in "$script" __WG_SCRIPT__ "'$ps1_win'")"
+  script="$(fill_in "$script" __WG_FILTER__ "$filter")"
+  script="$(fill_in "$script" __WG_PIDS__ "$(pid_list_to_csv "$pids")")"
 
   powershell_eval "$script" | grep -E '^[0-9]+ (ours|killed|foreign|gone)$'
 }
@@ -967,11 +973,9 @@ Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }
 POWERSHELL
   )"
-  # The replacement is quoted so bash 5.2 does not read a & in the path as
-  # "insert the match here".
-  script="${script//__WG_SCRIPT__/"'$ps1_win'"}"
-  script="${script//__WG_KEEP__/"$(pid_list_to_csv "$recorded")"}"
-  script="${script//__WG_MIN_AGE__/$SWEEP_MIN_AGE_SECONDS}"
+  script="$(fill_in "$script" __WG_SCRIPT__ "'$ps1_win'")"
+  script="$(fill_in "$script" __WG_KEEP__ "$(pid_list_to_csv "$recorded")")"
+  script="$(fill_in "$script" __WG_MIN_AGE__ "$SWEEP_MIN_AGE_SECONDS")"
 
   # Killed in the same trip that finds them.
   for pid in $(powershell_eval "$script" | grep -E '^[0-9]+$'); do
