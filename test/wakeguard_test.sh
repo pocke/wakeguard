@@ -16,13 +16,16 @@ setup() {
   export WAKEGUARD_CMD='sleep 3600'
   export WAKEGUARD_MAX_HOURS=8
   export WAKEGUARD_LOG="$WORK/log"
+  export WAKEGUARD_LOCK_WAIT_SECONDS=2
   SESSIONS="$XDG_STATE_HOME/wakeguard/sessions"
   LOCKS="$XDG_STATE_HOME/wakeguard/locks"
+  STRAYS=()
 }
 
 teardown() {
   local pid
-  for pid in $(sed -n 's/.*started holder pid=\([0-9]*\).*/\1/p' "$WAKEGUARD_LOG" 2>/dev/null); do
+  for pid in $(sed -n 's/.*started holder pid=\([0-9]*\).*/\1/p' "$WAKEGUARD_LOG" 2>/dev/null) \
+             ${STRAYS[@]+"${STRAYS[@]}"}; do
     kill "$pid" 2>/dev/null
   done
   rm -rf "$WORK"
@@ -46,11 +49,19 @@ hold_lock() {
   local lock="$LOCKS/$1.lock" pid
   # Without closing its stdout the command substitution around this function
   # would wait for the whole sleep.
-  sleep 60 >/dev/null 2>&1 &
+  sleep 30 >/dev/null 2>&1 &
   pid=$!
   mkdir -p "$lock"
   printf '%s %s\n' "$pid" "$(date '+%s')" >"$lock/owner"
   printf '%s' "$pid"
+}
+
+# Ages a holder past WAKEGUARD_MAX_HOURS without waiting for it.
+backdate_pidfile() {
+  local pidfile="$1" seconds="$2" started
+  started="$(field "$pidfile" STARTED_AT)"
+  sed "s/^STARTED_AT=.*/STARTED_AT=$(( started - seconds ))/" "$pidfile" >"$pidfile.aged"
+  mv "$pidfile.aged" "$pidfile"
 }
 
 # A pid that is certain to be gone.
@@ -87,10 +98,25 @@ assert_no_file() {
   [ ! -e "$1" ] || fail "$2: $1 still exists"
 }
 
+# SessionEnd hands its work to a detached process, so the caller sees the
+# result appear rather than be there on return.
+wait_gone() {
+  local path="$1" tries=100
+  while [ -e "$path" ] && [ "$tries" -gt 0 ]; do
+    sleep 0.1
+    tries=$(( tries - 1 ))
+  done
+}
+
+assert_log() {
+  grep -q -- "$1" "$WAKEGUARD_LOG" 2>/dev/null || fail "$2: nothing logged about '$1'"
+}
+
 run_tests() {
   local name
   for name in $(declare -F | sed -n 's/^declare -f \(test_.*\)/\1/p'); do
     CURRENT="$name"
+    printf '.. %s\n' "$name"
     setup
     "$name"
     teardown
@@ -167,16 +193,27 @@ test_stop_releases_when_the_event_carries_no_prompt_id() {
 test_start_waits_for_a_lock_held_by_a_live_process() {
   local owner
   owner="$(hold_lock s1)"
-
-  wg start "$(turn s1 p1)" &
-  sleep 2
+  STRAYS+=("$owner")
+  WAKEGUARD_LOCK_WAIT_SECONDS=20 wg start "$(turn s1 p1)" &
+  sleep 1
   assert_no_file "$SESSIONS/s1.pid" 'start should wait rather than touch a locked pidfile'
 
+  # Killing the owner alone: the waiting start has to notice and take the lock
+  # over by itself, the way it would after a hook was killed mid-turn.
   kill "$owner" 2>/dev/null
-  rm -rf "$LOCKS/s1.lock"
   wait
-  assert_file "$SESSIONS/s1.pid" 'start should go through once the lock is free'
+  assert_file "$SESSIONS/s1.pid" 'start should take over the lock of a process that is gone'
   assert_alive "$(field "$SESSIONS/s1.pid" HOLDER_PID)" 'the holder should be running'
+}
+
+test_start_gives_up_on_a_lock_it_cannot_take() {
+  local owner
+  owner="$(hold_lock s1)"
+  STRAYS+=("$owner")
+
+  wg start "$(turn s1 p1)"
+  assert_no_file "$SESSIONS/s1.pid" 'start should not touch a pidfile it never locked'
+  assert_log 'the lock stayed taken' 'giving up should leave a trace'
 }
 
 test_start_takes_over_a_lock_whose_owner_is_gone() {
@@ -194,32 +231,60 @@ test_a_lock_is_released_after_the_subcommand() {
   assert_no_file "$LOCKS/s1.lock" 'start should not leave its lock behind'
 }
 
+test_starts_racing_each_other_produce_one_holder() {
+  local started
+  wg start "$(turn s1 p1)" &
+  wg start "$(turn s1 p2)" &
+  wg start "$(turn s1 p3)" &
+  wait
+
+  started="$(grep -c 'started holder' "$WAKEGUARD_LOG")"
+  assert_eq "$started" 1 'three starts at once should agree on one holder'
+  assert_alive "$(field "$SESSIONS/s1.pid" HOLDER_PID)" 'the holder should be running'
+}
+
+test_a_stop_racing_the_next_start_leaves_a_live_holder() {
+  local pid
+  wg start "$(turn s1 p1)"
+  pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
+
+  wg stop "$(turn s1 p1)" &
+  wg start "$(turn s1 p2)" &
+  wait
+
+  assert_file "$SESSIONS/s1.pid" 'the second turn should end up with a pidfile'
+  assert_alive "$(field "$SESSIONS/s1.pid" HOLDER_PID)" 'the second turn should end up suppressing sleep'
+  assert_eq "$(field "$SESSIONS/s1.pid" PROMPT_ID)" p2 'the pidfile should belong to the second turn'
+  [ "$(field "$SESSIONS/s1.pid" HOLDER_PID)" = "$pid" ] || assert_dead "$pid" 'a replaced holder should not be left running'
+}
+
 # --- reap ---------------------------------------------------------------------
 
 test_reap_skips_a_locked_pidfile() {
   local pid owner
-  WAKEGUARD_MAX_HOURS=0.001 wg start "$(turn s1 p1)"
+  wg start "$(turn s1 p1)"
   pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
-  sleep 5
+  backdate_pidfile "$SESSIONS/s1.pid" 90000
   owner="$(hold_lock s1)"
+  STRAYS+=("$owner")
 
-  WAKEGUARD_MAX_HOURS=0.001 wg reap
+  wg reap
   assert_alive "$pid" 'reap should leave a pidfile another wakeguard is holding'
   assert_file "$SESSIONS/s1.pid" 'reap should leave the pidfile it skipped'
 
   kill "$owner" 2>/dev/null
   rm -rf "$LOCKS/s1.lock"
-  WAKEGUARD_MAX_HOURS=0.001 wg reap
+  wg reap
   assert_dead "$pid" 'reap should release the holder once the lock is free'
 }
 
 test_reap_releases_a_holder_past_the_deadline() {
   local pid
-  WAKEGUARD_MAX_HOURS=0.001 wg start "$(turn s1 p1)"
+  wg start "$(turn s1 p1)"
   pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
-  sleep 5
+  backdate_pidfile "$SESSIONS/s1.pid" 90000
 
-  WAKEGUARD_MAX_HOURS=0.001 wg reap
+  wg reap
   assert_dead "$pid" 'a holder past WAKEGUARD_MAX_HOURS should be reaped'
   assert_no_file "$SESSIONS/s1.pid" 'the pidfile should be gone after reap'
 }
@@ -233,6 +298,28 @@ test_reap_removes_a_lock_nobody_holds() {
   assert_no_file "$lock" 'reap should clear out an abandoned lock'
 }
 
+test_a_second_reap_does_nothing_while_the_first_runs() {
+  local owner
+  owner="$(hold_lock 'reap+all')"
+  STRAYS+=("$owner")
+
+  wg reap
+  assert_log 'another reap is already running' 'the second reap should stand down'
+}
+
+test_a_reap_lock_nobody_signed_does_not_wedge_reap() {
+  local pid
+  mkdir -p "$LOCKS/reap+all.lock"
+  touch -d '3 hours ago' "$LOCKS/reap+all.lock" 2>/dev/null ||
+    touch -A -030000 "$LOCKS/reap+all.lock"
+  wg start "$(turn s1 p1)"
+  pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
+  backdate_pidfile "$SESSIONS/s1.pid" 90000
+
+  wg reap
+  assert_dead "$pid" 'reap should take over a lock left without an owner and carry on'
+}
+
 # --- session end --------------------------------------------------------------
 
 test_end_releases_the_turn_holder_and_every_subagent_holder() {
@@ -243,10 +330,25 @@ test_end_releases_the_turn_holder_and_every_subagent_holder() {
   agent_pid="$(field "$SESSIONS/s1.a1.pid" HOLDER_PID)"
 
   wg end '{"session_id":"s1"}'
+  assert_log 'handed over to pid=' 'end should not do the work in the hook itself'
+  wait_gone "$SESSIONS/s1.pid"
+  wait_gone "$SESSIONS/s1.a1.pid"
+
   assert_dead "$turn_pid" 'end should release the turn holder'
   assert_dead "$agent_pid" 'end should release the subagent holder'
   assert_no_file "$SESSIONS/s1.pid" 'end should drop the turn pidfile'
   assert_no_file "$SESSIONS/s1.a1.pid" 'end should drop the subagent pidfile'
+}
+
+test_stop_leaves_a_pid_that_belongs_to_something_else() {
+  local pid
+  wg start "$(turn s1 p1)"
+  pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
+  sed 's/^HOLDER_KIND=.*/HOLDER_KIND=not-a-real-command/' "$SESSIONS/s1.pid" >"$SESSIONS/s1.pid.x"
+  mv "$SESSIONS/s1.pid.x" "$SESSIONS/s1.pid"
+
+  wg stop "$(turn s1 p1)"
+  assert_alive "$pid" 'a recycled pid should never get an unrelated process killed'
 }
 
 test_a_subagent_holder_outlives_the_turn_that_spawned_it() {

@@ -234,17 +234,12 @@ is_pid() {
 
 # --- locking ------------------------------------------------------------------
 #
-# The hooks run in the background, so a turn that ends while the next prompt is
-# already queued has its stop and the next start reading and writing one pidfile
-# at the same time. Everything that touches a pidfile holds its lock.
+# Everything that touches a pidfile holds its lock.
 
-LOCK_WAIT_SECONDS=20
-# A holder that lives through a whole session is normal; a wakeguard run that
-# does is not. Kept at SWEEP_MIN_AGE_SECONDS so both waits read the same.
+LOCK_WAIT_SECONDS="${WAKEGUARD_LOCK_WAIT_SECONDS:-20}"
+# A holder that lives through a whole session is expected; a wakeguard run that
+# does is not.
 LOCK_STALE_SECONDS=120
-# How many rounds a lock may stay anonymous before it counts as abandoned. The
-# process that wins mkdir writes its owner a moment later.
-LOCK_ANONYMOUS_ROUNDS=25
 LOCK_POLL_SECONDS=0.2
 
 HELD_LOCKS=()
@@ -255,33 +250,25 @@ lock_path() {
 
 # Waits up to $2 seconds for the lock named $1. Fails when the wait runs out.
 acquire_lock() {
-  local name="$1" wait_seconds="$2" lock deadline anonymous=0
+  local name="$1" wait_seconds="$2" lock deadline
   lock="$(lock_path "$name")"
   deadline=$(( $(date '+%s') + wait_seconds ))
 
   (umask 077 && mkdir -p "$LOCKS_DIR") 2>/dev/null || return 1
   while :; do
     if mkdir "$lock" 2>/dev/null; then
-      printf '%s %s\n' "$$" "$(date '+%s')" >"$lock/owner" 2>/dev/null
-      HELD_LOCKS+=("$lock")
-      return 0
+      # A lock nobody can be identified through is one nobody can hand back,
+      # so failing to sign it is failing to take it.
+      # The 2>/dev/null comes first so that the redirection failing is quiet.
+      if printf '%s %s\n' "$$" "$(date '+%s')" 2>/dev/null >"$lock/owner"; then
+        HELD_LOCKS+=("$lock")
+        return 0
+      fi
+      rmdir "$lock" 2>/dev/null
+      return 1
     fi
 
-    if [ -r "$lock/owner" ]; then
-      anonymous=0
-      if lock_is_stale "$lock"; then
-        steal_lock "$lock"
-        continue
-      fi
-    else
-      anonymous=$(( anonymous + 1 ))
-      if [ "$anonymous" -ge "$LOCK_ANONYMOUS_ROUNDS" ]; then
-        steal_lock "$lock"
-        anonymous=0
-        continue
-      fi
-    fi
-
+    lock_is_stale "$lock" && steal_lock "$lock" && continue
     [ "$(date '+%s')" -lt "$deadline" ] || return 1
     sleep "$LOCK_POLL_SECONDS" 2>/dev/null || sleep 1
   done
@@ -295,11 +282,18 @@ lock_is_stale() {
   owner="$(cat "$lock/owner" 2>/dev/null)"
   pid="${owner%% *}"
   taken_at="${owner##* }"
+  case "$taken_at" in ''|*[!0-9]*) taken_at='' ;; esac
 
-  is_pid "$pid" || return 1
+  # Between the mkdir that takes a lock and the line that signs it, and again
+  # between unsigning it and removing it, a lock says nothing about who holds
+  # it. Its own age is then the only thing that tells a live one from a corpse.
+  if ! is_pid "$pid" || [ -z "$taken_at" ]; then
+    [ -n "$(find "$lock" -maxdepth 0 -mmin "+$(( LOCK_STALE_SECONDS / 60 ))" 2>/dev/null)" ]
+    return
+  fi
+
   kill -0 "$pid" 2>/dev/null || return 0
   # The pid may have been recycled by an unrelated process.
-  case "$taken_at" in ''|*[!0-9]*) return 1 ;; esac
   [ "$(( $(date '+%s') - 10#$taken_at ))" -gt "$LOCK_STALE_SECONDS" ]
 }
 
@@ -321,7 +315,11 @@ release_lock() {
   unset 'HELD_LOCKS[count - 1]'
 
   owner="$(cat "$lock/owner" 2>/dev/null)"
-  [ "${owner%% *}" = "$$" ] || return 0
+  if [ "${owner%% *}" != "$$" ]; then
+    # Losing the lock means the pidfile was open to somebody else all along.
+    log "the lock $lock was taken from us"
+    return 0
+  fi
   rm -f "$lock/owner" 2>/dev/null
   rmdir "$lock" 2>/dev/null
 }
@@ -601,8 +599,14 @@ cmd_start() {
       # that a later turn has taken over. STARTED_AT stays as it was, so reap
       # goes on measuring the holder's age against WAKEGUARD_MAX_HOURS.
       PROMPT_ID="$prompt_id"
-      write_pidfile "$pidfile" || log "start $key: cannot update $pidfile"
-      log "start $key: holder pid=$HOLDER_PID is $state, keeping it for prompt=$prompt_id"
+      if write_pidfile "$pidfile"; then
+        log "start $key: holder pid=$HOLDER_PID is $state, keeping it for prompt=$prompt_id"
+      else
+        # A holder still recorded against the turn before this one is a holder
+        # this turn's stop will refuse to touch.
+        log "start $key: cannot update $pidfile"
+        release_pidfile "$pidfile" "start $key" || true
+      fi
       return 0
     fi
   fi
@@ -645,23 +649,37 @@ cmd_stop() {
     { log "stop $key: the lock stayed taken, leaving the holder to end and reap"; return 0; }
 
   if ! read_pidfile "$pidfile"; then
-    log "stop session=$key: no holder pid recorded"
+    log "stop $key: no holder pid recorded"
     rm -f "$pidfile" 2>/dev/null || true
     return 0
   fi
-  # Hooks reach here out of order, so a mismatch means a later turn already
-  # took the holder over. A pidfile written before wakeguard recorded prompts
-  # carries no id at all, and gets released the way it always was.
+  # Hooks reach here out of order, so a mismatch means a later turn already took
+  # the holder over. Either side missing an id leaves the two impossible to
+  # pair, and the holder is released.
   if [ -n "$PROMPT_ID" ] && [ -n "$prompt_id" ] && [ "$PROMPT_ID" != "$prompt_id" ]; then
-    log "stop session=$key: holder belongs to prompt=$PROMPT_ID, not $prompt_id, leaving it"
+    log "stop $key: holder belongs to prompt=$PROMPT_ID, not $prompt_id, leaving it"
     return 0
   fi
-  release_pidfile "$pidfile" "stop session=$key" || true
+  release_pidfile "$pidfile" "stop $key" || true
 }
 
-# SessionEnd is the one hook that still blocks, and it shares its budget with
-# every other SessionEnd hook, so the waiting is capped for the whole run rather
-# than per pidfile.
+# Every SessionEnd hook on the machine shares a budget of 1.5 seconds, and a
+# plugin's own timeout does not raise it:
+# https://code.claude.com/docs/en/hooks#sessionend
+# Releasing one holder costs a round trip to the Windows host, so a session with
+# a few subagents cannot be cleaned up inside that. The hook therefore hands the
+# work to a process that outlives it, which is what the same page recommends for
+# anything that has to survive the session.
+detach_end() {
+  local session_id="$1" detached
+
+  run_detached env "WAKEGUARD_END_SESSION=$session_id" bash "$0" end
+  detached="$HOLDER_PID"
+  log "end $session_id: handed over to pid=$detached"
+}
+
+# The waiting is capped for the whole run rather than per pidfile, so a session
+# with several holders cannot spend its time on the first lock it finds taken.
 END_LOCK_BUDGET_SECONDS=3
 
 # Everything this session recorded, not just its turn holder. Subagent holders
@@ -671,7 +689,9 @@ cmd_end() {
   local session_id="$1" pidfile session deadline remaining
   deadline=$(( $(date '+%s') + END_LOCK_BUDGET_SECONDS ))
 
-  for pidfile in "$SESSIONS_DIR/$session_id".*.pid "$(pidfile_path "$session_id")"; do
+  # The turn holder goes first: it is the one a lock this run never gets would
+  # leave suppressing sleep with nothing but reap to notice.
+  for pidfile in "$(pidfile_path "$session_id")" "$SESSIONS_DIR/$session_id".*.pid; do
     [ -e "$pidfile" ] || continue
     session="$(pidfile_session "$pidfile")"
 
@@ -723,10 +743,10 @@ reap_reason() {
   fi
 }
 
-# Names the lock that keeps two sessions starting at once from sweeping against
-# each other's half-read view of the pidfiles. No session id can collide with
-# it: json_string_field turns a dot into an underscore.
-REAP_LOCK='.reap'
+# No pidfile can be named this: json_string_field reduces an id to letters,
+# digits, underscores and dashes, and the pidfiles reap walks are named after
+# one or two of those.
+REAP_LOCK='reap+all'
 
 cmd_reap() {
   local pidfile session state reason
@@ -767,12 +787,18 @@ cmd_reap() {
     release_lock
   done
 
-  sweep_unrecorded_windows "$windows_pids"
-  sweep_unrecorded_systemd "$unix_pids"
+  # The sweeps recognize a holder by the one thing wakeguard gave it, and an
+  # arbitrary command was given nothing. Every systemd-inhibit and every
+  # PowerShell holder on the machine then belongs to somebody else.
+  if [ -z "$WAKEGUARD_CMD" ]; then
+    sweep_unrecorded_windows "$windows_pids"
+    sweep_unrecorded_systemd "$unix_pids"
+  fi
   sweep_abandoned_locks
 }
 
-# Adds the holder read_pidfile has loaded to the list the sweeps must spare.
+# Appends the holder read_pidfile has loaded to cmd_reap's windows_pids or
+# unix_pids, the lists it hands the sweeps.
 keep_holder() {
   if holder_is_windows; then
     windows_pids="$windows_pids $HOLDER_PID"
@@ -885,6 +911,11 @@ main() {
       # A failed suppression must never break the user's turn.
       trap 'release_locks; exit 0' EXIT
       load_config
+
+      if [ "$subcommand" = end ] && [ -n "${WAKEGUARD_END_SESSION:-}" ]; then
+        cmd_end "$WAKEGUARD_END_SESSION"
+        return 0
+      fi
       input="$(drain_stdin)"
 
       session_id="$(json_string_field "$input" session_id)"
@@ -904,13 +935,14 @@ main() {
             log "no agent id in the hook input, doing nothing"
             return 0
           fi
-          # No prompt id: a subagent holder is meant to outlive the turn that
-          # spawned it, and pairing start with stop is what agent_id already
-          # does.
+          # No prompt id: a subagent holder outlives the turn that spawned it,
+          # so its stop arrives carrying a turn this holder never belonged to.
+          # SubagentStart blocks instead, which is what stops an agent-stop from
+          # arriving while the start it belongs to is still running.
           "cmd_${subcommand#agent-}" "$session_id.$agent_id" ''
           ;;
         end)
-          cmd_end "$session_id"
+          detach_end "$session_id"
           ;;
         *)
           "cmd_$subcommand" "$session_id" "$(json_string_field "$input" prompt_id)"
