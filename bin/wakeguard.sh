@@ -511,7 +511,7 @@ holder_is_windows() {
 
 holder_state() {
   if holder_is_windows; then
-    windows_holder_probe ''
+    windows_state "$HOLDER_PID"
   else
     unix_holder_state
   fi
@@ -540,27 +540,75 @@ unix_holder_state() {
 
 # Every powershell.exe on the machine answers to ProcessName "powershell", so
 # only the holder script in its command line tells ours apart from a session
-# the user opened. Answering in the same trip that kills keeps stop down to one
-# interop round trip, which costs several hundred milliseconds.
-windows_holder_probe() {
-  local action="$1" ps1_win script out
+# the user opened.
+#
+# Reaching the Windows host costs several hundred milliseconds, and it costs the
+# same whether the question is about one holder or twenty, so the question is
+# asked about all of them at once. Answers "<pid> <state>" a line at a time, and
+# says nothing at all about a pid it could not reach a verdict on.
+windows_holders_probe() {
+  local pids="$1" action="$2" ps1_win filter='' pid script
 
-  is_pid "$HOLDER_PID" || { printf unknown; return; }
   # An empty needle would make Contains match every powershell on the machine.
-  ps1_win="$(holder_script_winpath)" || { printf unknown; return; }
+  ps1_win="$(holder_script_winpath)" || return 0
+  for pid in $pids; do
+    filter="${filter:+$filter or }ProcessId=$pid"
+  done
+  [ -n "$filter" ] || return 0
 
-  script='$p = Get-CimInstance Win32_Process -Filter "ProcessId=__WG_PID__"
-if (-not $p) { "gone" }
-elseif ($p.CommandLine -and $p.CommandLine.Contains(__WG_SCRIPT__)) { __WG_ACTION__ }
-else { "foreign" }'
-  script="${script//__WG_ACTION__/${action:-\"ours\"}}"
+  script="$(cat <<'POWERSHELL'
+$found = @{}
+Get-CimInstance Win32_Process -Filter "__WG_FILTER__" |
+  ForEach-Object { $found[[string]$_.ProcessId] = $_ }
+foreach ($id in @(__WG_PIDS__)) {
+  $p = $found[[string]$id]
+  if (-not $p) { "$id gone" }
+  elseif ($p.CommandLine -and $p.CommandLine.Contains(__WG_SCRIPT__)) { __WG_ACTION__ }
+  else { "$id foreign" }
+}
+POWERSHELL
+  )"
+  script="${script//__WG_ACTION__/${action:-\"\$id ours\"}}"
   # The replacement is quoted so bash 5.2 does not read a & in the path as
   # "insert the match here".
   script="${script//__WG_SCRIPT__/"'$ps1_win'"}"
-  script="${script//__WG_PID__/$HOLDER_PID}"
+  script="${script//__WG_FILTER__/$filter}"
+  script="${script//__WG_PIDS__/$(pid_list_to_csv "$pids")}"
 
-  out="$(powershell_eval "$script" | grep -E '^(ours|killed|foreign|gone)$' | head -n 1)"
-  printf '%s' "${out:-unknown}"
+  powershell_eval "$script" | grep -E '^[0-9]+ (ours|killed|foreign|gone)$'
+}
+
+# Kills every holder in $1 in one round trip. A Stop-Process that is refused
+# would otherwise end the loop and leave the rest of the pids unanswered, and a
+# refusal means the holder is still running, which is not "killed".
+windows_holders_release() {
+  windows_holders_probe "$1" \
+    'try { Stop-Process -Id $id -Force -ErrorAction Stop; "$id killed" } catch { }'
+}
+
+# What a batch answered about one pid, or nothing when it did not answer.
+state_of() {
+  local answers="$1" pid="$2" line
+  line="$(printf '%s\n' "$answers" | grep -m 1 -E "^$pid ")" || return 1
+  printf '%s' "${line#* }"
+}
+
+# What the walk over the pidfiles already asked the Windows host, so that no
+# path asks a second time for the same holder.
+WINDOWS_STATES=''
+
+prefetch_windows_states() {
+  WINDOWS_STATES="$(windows_holders_probe "$1" '')"
+}
+
+windows_state() {
+  local pid="$1" state
+
+  is_pid "$pid" || { printf unknown; return; }
+  state="$(state_of "$WINDOWS_STATES" "$pid")" ||
+    state="$(state_of "$(windows_holders_probe "$pid" '')" "$pid")" ||
+    state=unknown
+  printf '%s' "$state"
 }
 
 # Kills the holder when it is still ours, and reports what happened using the
@@ -569,9 +617,9 @@ holder_release() {
   local state
 
   if holder_is_windows; then
-    # -ErrorAction Stop: without it a refused Stop-Process is non-terminating
-    # and "killed" would be reported for a holder that is still running.
-    windows_holder_probe 'Stop-Process -Id __WG_PID__ -Force -ErrorAction Stop; "killed"'
+    state="$(state_of "$(windows_holders_release "$HOLDER_PID")" "$HOLDER_PID")" ||
+      state=unknown
+    printf '%s' "$state"
     return
   fi
 
@@ -629,16 +677,53 @@ cmd_start() {
   log "started holder pid=$HOLDER_PID kind=$HOLDER_KIND session=$key prompt=$prompt_id"
 }
 
-# Releases the holder that read_pidfile has already loaded, then drops the
-# pidfile. Fails, and keeps the pidfile, when the holder's fate could not be
-# determined: the pidfile is the only way back to it.
-release_pidfile() {
-  local pidfile="$1" label="$2" outcome
+# Records what became of a holder and drops the pidfile that named it. Fails,
+# and keeps the pidfile, when the holder's fate could not be determined: the
+# pidfile is the only way back to it.
+apply_outcome() {
+  local pidfile="$1" label="$2" pid="$3" kind="$4" outcome="$5"
 
-  outcome="$(holder_release)"
-  log "$label holder=$HOLDER_PID kind=$HOLDER_KIND: $outcome"
+  log "$label holder=$pid kind=$kind: $outcome"
   [ "$outcome" != unknown ] || return 1
   rm -f "$pidfile" 2>/dev/null || true
+}
+
+# Releases the holder that read_pidfile has already loaded.
+release_pidfile() {
+  local pidfile="$1" label="$2"
+
+  apply_outcome "$pidfile" "$label" "$HOLDER_PID" "$HOLDER_KIND" "$(holder_release)"
+}
+
+# Holders waiting for one shared round trip to the Windows host, the pidfiles
+# that named them, and what each release is being logged as. Their locks stay
+# held until the batch has answered for them.
+PENDING_PIDS=()
+PENDING_PIDFILES=()
+PENDING_LABELS=()
+
+pend_release() {
+  PENDING_PIDFILES+=("$1")
+  PENDING_LABELS+=("$2")
+  PENDING_PIDS+=("$HOLDER_PID")
+}
+
+flush_releases() {
+  local answers count="${#PENDING_PIDS[@]}" i=0 pid outcome
+
+  [ "$count" -gt 0 ] || return 0
+  answers="$(windows_holders_release "${PENDING_PIDS[*]}")"
+
+  while [ "$i" -lt "$count" ]; do
+    pid="${PENDING_PIDS[i]}"
+    outcome="$(state_of "$answers" "$pid")" || outcome=unknown
+    apply_outcome "${PENDING_PIDFILES[i]}" "${PENDING_LABELS[i]}" \
+      "$pid" powershell "$outcome" || true
+    i=$(( i + 1 ))
+  done
+  PENDING_PIDS=()
+  PENDING_PIDFILES=()
+  PENDING_LABELS=()
 }
 
 cmd_stop() {
@@ -666,10 +751,10 @@ cmd_stop() {
 # Every SessionEnd hook on the machine shares a budget of 1.5 seconds, and a
 # plugin's own timeout does not raise it:
 # https://code.claude.com/docs/en/hooks#sessionend
-# Releasing one holder costs a round trip to the Windows host, so a session with
-# a few subagents cannot be cleaned up inside that. The hook therefore hands the
-# work to a process that outlives it, which is what the same page recommends for
-# anything that has to survive the session.
+# One round trip to the Windows host is a third of that before any other hook
+# has run, and a lock this run has to wait for is more. The hook therefore hands
+# the work to a process that outlives it, which is what the same page recommends
+# for anything that has to survive the session.
 detach_end() {
   local session_id="$1" detached
 
@@ -686,7 +771,7 @@ END_LOCK_BUDGET_SECONDS=3
 # outlive the turn that started them on purpose, so only the end of the session
 # may sweep them up.
 cmd_end() {
-  local session_id="$1" pidfile session deadline remaining
+  local session_id="$1" pidfile session deadline remaining locked=0
   deadline=$(( $(date '+%s') + END_LOCK_BUDGET_SECONDS ))
 
   # The turn holder goes first: it is the one a lock this run never gets would
@@ -701,14 +786,22 @@ cmd_end() {
       log "end $session: the lock stayed taken, leaving the holder to reap"
       continue
     fi
+    locked=$(( locked + 1 ))
 
-    if read_pidfile "$pidfile"; then
-      release_pidfile "$pidfile" "end $session" || true
-    else
+    if ! read_pidfile "$pidfile"; then
       log "end $session: no holder pid recorded"
       rm -f "$pidfile" 2>/dev/null || true
+    elif holder_is_windows; then
+      pend_release "$pidfile" "end $session"
+    else
+      release_pidfile "$pidfile" "end $session" || true
     fi
+  done
+
+  flush_releases
+  while [ "$locked" -gt 0 ]; do
     release_lock
+    locked=$(( locked - 1 ))
   done
 }
 
@@ -749,8 +842,9 @@ reap_reason() {
 REAP_LOCK='reap+all'
 
 cmd_reap() {
-  local pidfile session state reason
+  local pidfile session state reason locked=0 to_probe=''
   local windows_pids='' unix_pids=''
+  local -a mine=()
 
   acquire_lock "$REAP_LOCK" 0 ||
     { log 'reap: another reap is already running'; return 0; }
@@ -768,23 +862,43 @@ cmd_reap() {
       read_pidfile "$pidfile" && keep_holder
       continue
     fi
+    locked=$(( locked + 1 ))
+    mine+=("$pidfile")
 
+    if read_pidfile "$pidfile" && holder_is_windows; then
+      to_probe="$to_probe $HOLDER_PID"
+    fi
+  done
+
+  # One question about every windows holder at once, before any of them is
+  # judged. holder_state answers out of this for the rest of the run.
+  prefetch_windows_states "$to_probe"
+
+  for pidfile in ${mine[@]+"${mine[@]}"}; do
+    session="$(pidfile_session "$pidfile")"
     if ! read_pidfile "$pidfile"; then
       log "reaping $session: no holder pid recorded"
       rm -f "$pidfile" 2>/dev/null || true
-      release_lock
       continue
     fi
 
     state="$(holder_state)"
     reason="$(reap_reason "$state")"
-    if [ -n "$reason" ] && release_pidfile "$pidfile" "reaping $session ($reason)"; then
-      release_lock
-      continue
+    if [ -n "$reason" ]; then
+      if holder_is_windows; then
+        pend_release "$pidfile" "reaping $session ($reason)"
+        continue
+      fi
+      release_pidfile "$pidfile" "reaping $session ($reason)" && continue
     fi
 
     keep_holder
+  done
+
+  flush_releases
+  while [ "$locked" -gt 0 ]; do
     release_lock
+    locked=$(( locked - 1 ))
   done
 
   # The sweeps recognize a holder by the one thing wakeguard gave it, and an
@@ -875,10 +989,18 @@ pid_list_to_csv() {
 }
 
 cmd_status() {
-  local pidfile found=0 state
+  local pidfile found=0 state to_probe=''
 
   printf 'env: %s\n' "$(detect_env)"
   printf 'sessions dir: %s\n' "$SESSIONS_DIR"
+
+  for pidfile in "$SESSIONS_DIR"/*.pid; do
+    [ -e "$pidfile" ] || continue
+    if read_pidfile "$pidfile" && holder_is_windows; then
+      to_probe="$to_probe $HOLDER_PID"
+    fi
+  done
+  prefetch_windows_states "$to_probe"
 
   for pidfile in "$SESSIONS_DIR"/*.pid; do
     [ -e "$pidfile" ] || continue

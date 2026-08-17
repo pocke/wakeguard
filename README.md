@@ -70,6 +70,12 @@ and each records the `prompt_id` it belongs to so the order they arrive in
 stops mattering: a `stop` carrying a different id has been overtaken by a later
 turn, and leaves the holder to it.
 
+Asking the Windows host about a holder costs the same round trip whether it is
+asked about one or twenty, so `end`, `reap` and `status` ask about all of theirs
+at once. On this machine a `reap` that has to release four holders takes 1.3
+seconds instead of 3.7, and `status` on the same four 0.4 seconds instead of
+1.9.
+
 `agent-start` is the exception because a subagent holder has no turn to belong
 to — its `stop` names a different turn from its `start`, so `prompt_id` cannot
 pair them. Blocking is what keeps a subagent that fails immediately from having
