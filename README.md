@@ -41,10 +41,12 @@ sleep, so overlapping sessions need no shared counter. Releasing the suppression
 is nothing more than killing the holder.
 
 ```
-UserPromptSubmit  ->  wakeguard.sh start   launch a holder, record a pidfile
-Stop, StopFailure ->  wakeguard.sh stop    kill the holder, delete the pidfile
-SessionEnd        ->  wakeguard.sh stop
-SessionStart      ->  wakeguard.sh reap    clean up orphaned holders
+UserPromptSubmit  ->  wakeguard.sh start        launch a holder, record a pidfile
+Stop, StopFailure ->  wakeguard.sh stop         kill this turn's holder
+SubagentStart     ->  wakeguard.sh agent-start  launch a holder for one subagent
+SubagentStop      ->  wakeguard.sh agent-stop   kill that subagent's holder
+SessionEnd        ->  wakeguard.sh end          kill every holder this session has
+SessionStart      ->  wakeguard.sh reap         clean up orphaned holders
 ```
 
 The holder per environment:
@@ -60,7 +62,12 @@ Suppressing sleep inside WSL2 would achieve nothing, because the Windows host
 suspends the whole VM when it sleeps. WSL2 therefore always puts the holder on
 the host side.
 
-Pidfiles live in `${XDG_STATE_HOME:-~/.local/state}/wakeguard/sessions/`.
+A subagent keeps working after the turn that spawned it has ended, so each one
+gets a holder of its own that lives until its `SubagentStop` arrives. Waiting
+for a review or a search to come back does not let the machine sleep.
+
+Pidfiles live in `${XDG_STATE_HOME:-~/.local/state}/wakeguard/sessions/`, named
+`<session_id>.pid` for a turn and `<session_id>.<agent_id>.pid` for a subagent.
 
 ## Configuration
 
@@ -100,7 +107,8 @@ Every way a session can end has something that releases the suppression:
 | How it ends | What releases it |
 |---|---|
 | Turn finishes, normally or on an API error | `Stop` / `StopFailure` hook |
-| Session ends with exit or Ctrl-C | `SessionEnd` hook |
+| Session ends with exit or Ctrl-C | `SessionEnd` hook, which clears every holder the session has, subagent holders included |
+| A subagent finishes | `SubagentStop` hook |
 | Claude Code is killed or crashes | macOS: `caffeinate -w` exits with it. Everywhere: the next `SessionStart` reap notices the dead pid |
 | A hook is killed before it records the holder | The next `SessionStart` reap sweeps holders that no pidfile claims, on Windows and Linux. macOS has no sweep: `caffeinate` carries no marker telling ours from one the user started by hand, so an unrecorded one falls back to `caffeinate -w` and then to its `-t` deadline |
 | No hook fires at all | The holder's own `WAKEGUARD_MAX_HOURS` deadline. A `WAKEGUARD_CMD` holder gets neither this nor the sweep, since wakeguard can neither give a deadline to an arbitrary command nor recognize one it did not name |
@@ -113,7 +121,9 @@ process killed.
 
 **Two gaps worth knowing about.** Interrupting a turn with Esc is not a `Stop`
 event, so the holder stays until the next turn ends or the session does. Until
-then the machine will not sleep on its own.
+then the machine will not sleep on its own. Whether `SubagentStop` arrives when
+a subagent is interrupted along with the turn is unverified; if it does not, its
+holder stays just as long.
 
 And a Windows holder is recognized by the holder script's path, which carries
 the plugin version, so upgrading the plugin while a holder is running makes the
@@ -128,6 +138,9 @@ without consulting it, so the fallback does not hold there.
 
 ## Out of scope
 
-Background tasks. There is no event that reliably marks a background task as
-finished, so covering them would mean risking a suppression that is never
-released.
+**`Bash` run in the background.** No event reliably marks one as finished, so
+covering it would add a way to leave the suppression on forever.
+
+**`TaskCreated` / `TaskCompleted`.** These fire when an item is written to the
+task list or marked done, which says nothing about anything starting or
+finishing, so they cannot drive a suppression.

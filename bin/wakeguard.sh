@@ -8,14 +8,18 @@ CONFIG_FILE="${XDG_CONFIG_HOME:-${HOME:-}/.config}/wakeguard/config"
 
 usage() {
   cat <<'USAGE'
-Usage: wakeguard.sh <start|stop|reap|status>
+Usage: wakeguard.sh <start|stop|end|agent-start|agent-stop|reap|status>
 
-  start   Launch a detached sleep-inhibiting holder for this session.
-  stop    Kill the holder recorded for this session.
-  reap    Kill holders that no live session can still release.
-  status  Print every recorded holder and what state it is in.
+  start        Launch a detached sleep-inhibiting holder for this session.
+  stop         Kill the holder recorded for this session's turn.
+  end          Kill every holder this session recorded.
+  agent-start  Launch a holder for one subagent, which outlives the turn.
+  agent-stop   Kill the holder recorded for one subagent.
+  reap         Kill holders that no live session can still release.
+  status       Print every recorded holder and what state it is in.
 
-Hook events feed the session id on stdin as JSON.
+Hook events feed the session id, and for agent-* the agent id, on stdin
+as JSON.
 USAGE
 }
 
@@ -154,13 +158,20 @@ drain_stdin() {
   cat
 }
 
-session_id_from() {
-  local id
-  id="$(printf '%s' "$1" |
-    LC_ALL=C grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' |
+# Reads one string field out of the hook's JSON. The key goes into the pattern
+# unescaped, so pass a literal word. Matching it together with its quotes is
+# what keeps "agent_type" from answering for "agent_id".
+#
+# The answer is reduced to characters that are safe in a filename, and the dot
+# is not among them: ids are joined with one to name a subagent's pidfile, so a
+# dot inside an id would make two different pairs share a name.
+json_string_field() {
+  local json="$1" key="$2" value
+  value="$(printf '%s' "$json" |
+    LC_ALL=C grep -o "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" |
     head -n 1 |
     LC_ALL=C sed 's/.*"\([^"]*\)"$/\1/')"
-  printf '%s' "$id" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_'
+  printf '%s' "$value" | LC_ALL=C tr -c 'A-Za-z0-9_-' '_'
 }
 
 # --- pidfile ----------------------------------------------------------------
@@ -502,22 +513,45 @@ cmd_start() {
   log "started holder pid=$HOLDER_PID kind=$HOLDER_KIND session=$session_id"
 }
 
+# Releases the holder that read_pidfile has already loaded, then drops the
+# pidfile. Fails, and keeps the pidfile, when the holder's fate could not be
+# determined: the pidfile is the only way back to it.
+release_pidfile() {
+  local pidfile="$1" label="$2" outcome
+
+  outcome="$(holder_release)"
+  log "$label holder=$HOLDER_PID kind=$HOLDER_KIND: $outcome"
+  [ "$outcome" != unknown ] || return 1
+  rm -f "$pidfile" 2>/dev/null || true
+}
+
 cmd_stop() {
-  local session_id="$1" pidfile outcome
+  local session_id="$1" pidfile
   pidfile="$(pidfile_path "$session_id")"
 
   if ! read_pidfile "$pidfile"; then
+    log "stop session=$session_id: no holder pid recorded"
     rm -f "$pidfile" 2>/dev/null || true
     return 0
   fi
+  release_pidfile "$pidfile" "stop session=$session_id" || true
+}
 
-  outcome="$(holder_release)"
-  log "stop session=$session_id holder=$HOLDER_PID kind=$HOLDER_KIND: $outcome"
+# Everything this session recorded, not just its turn holder. Subagent holders
+# outlive the turn that started them on purpose, so only the end of the session
+# may sweep them up.
+cmd_end() {
+  local session_id="$1" pidfile
 
-  # The pidfile is the only way back to the holder, so it survives an outcome
-  # that leaves the holder's fate open.
-  [ "$outcome" = unknown ] && return 0
-  rm -f "$pidfile" 2>/dev/null || true
+  for pidfile in "$SESSIONS_DIR/$session_id".*.pid "$(pidfile_path "$session_id")"; do
+    [ -e "$pidfile" ] || continue
+    if ! read_pidfile "$pidfile"; then
+      log "end $(pidfile_session "$pidfile"): no holder pid recorded"
+      rm -f "$pidfile" 2>/dev/null || true
+      continue
+    fi
+    release_pidfile "$pidfile" "end $(pidfile_session "$pidfile")" || true
+  done
 }
 
 # Prints why a holder can no longer be released by the session that started it,
@@ -552,7 +586,7 @@ reap_reason() {
 }
 
 cmd_reap() {
-  local pidfile session state reason outcome
+  local pidfile session state reason
   local windows_pids='' unix_pids=''
 
   for pidfile in "$SESSIONS_DIR"/*.pid; do
@@ -568,12 +602,7 @@ cmd_reap() {
     state="$(holder_state)"
     reason="$(reap_reason "$state")"
     if [ -n "$reason" ]; then
-      outcome="$(holder_release)"
-      log "reaping $session: $reason ($outcome)"
-      if [ "$outcome" != unknown ]; then
-        rm -f "$pidfile" 2>/dev/null || true
-        continue
-      fi
+      release_pidfile "$pidfile" "reaping $session ($reason)" && continue
     fi
 
     if holder_is_windows; then
@@ -664,24 +693,47 @@ cmd_status() {
   [ "$found" = 1 ] || printf 'no holders recorded\n'
 }
 
+# An id that can name a pidfile. "." and ".." would name the directory itself.
+usable_id() {
+  case "${1:-}" in
+    ''|.|..) return 1 ;;
+  esac
+  return 0
+}
+
 main() {
-  local subcommand="${1:-}" session_id
+  local subcommand="${1:-}" input session_id agent_id
 
   case "$subcommand" in
-    start|stop)
+    start|stop|end|agent-start|agent-stop)
       # A failed suppression must never break the user's turn.
       trap 'exit 0' EXIT
       load_config
-      session_id="$(session_id_from "$(drain_stdin)")"
-      case "$session_id" in
-        ''|.|..)
-          # Without a stable id, start and stop can never find each other and
-          # every turn would leave one more holder behind.
-          log "no session id in the hook input, doing nothing"
-          return 0
+      input="$(drain_stdin)"
+
+      session_id="$(json_string_field "$input" session_id)"
+      if ! usable_id "$session_id"; then
+        # Without a stable id, start and stop can never find each other and
+        # every turn would leave one more holder behind.
+        log "no session id in the hook input, doing nothing"
+        return 0
+      fi
+
+      case "$subcommand" in
+        agent-*)
+          agent_id="$(json_string_field "$input" agent_id)"
+          if ! usable_id "$agent_id"; then
+            # The name would collapse to the session's own pidfile, and this
+            # subagent's stop would then kill the turn's holder.
+            log "no agent id in the hook input, doing nothing"
+            return 0
+          fi
+          "cmd_${subcommand#agent-}" "$session_id.$agent_id"
+          ;;
+        *)
+          "cmd_$subcommand" "$session_id"
           ;;
       esac
-      "cmd_$subcommand" "$session_id"
       ;;
     reap)
       trap 'exit 0' EXIT
