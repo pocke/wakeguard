@@ -25,6 +25,11 @@ repository itself, and no runtime is added.
 
 - **Everywhere**: `bash` and the basic Unix commands — `grep`, `sed`, `awk`,
   `ps` and the like; on Windows they come with Git Bash.
+- **Claude Code 2.1.72 or newer**, to get the hooks off the critical path.
+  2.1.72 is the first version that hands a background hook its stdin, and the
+  session id wakeguard needs arrives that way. An older version does not
+  understand the flag and keeps running the hooks the way it always did:
+  everything works, the prompt just waits for them.
 - **Windows and WSL2, on top of that**: Windows PowerShell 5.1, which ships
   with Windows. No extra modules. WSL2 reaches it over interop and converts
   paths with `wslpath`; Git Bash uses `cygpath`.
@@ -49,6 +54,18 @@ SessionEnd        ->  wakeguard.sh end          kill every holder this session h
 SessionStart      ->  wakeguard.sh reap         clean up orphaned holders
 ```
 
+Every one of these but `end` runs in the background, so nothing waits for it.
+Putting a holder on the Windows host costs a round trip through
+`powershell.exe` — a third of a second on the machine this was measured on —
+and no turn should have to spend that twice.
+
+Running in the background means one turn's `stop` and the next turn's `start`
+overlap, which is what happens whenever a prompt is queued while a turn is
+still finishing. Each pidfile has a lock beside it so the two take their turns,
+and each records the `prompt_id` it belongs to so the order they arrive in
+stops mattering: a `stop` carrying a different id has been overtaken by a later
+turn, and leaves the holder to it.
+
 The holder per environment:
 
 | Environment | Holder |
@@ -68,6 +85,7 @@ for a review or a search to come back does not let the machine sleep.
 
 Pidfiles live in `${XDG_STATE_HOME:-~/.local/state}/wakeguard/sessions/`, named
 `<session_id>.pid` for a turn and `<session_id>.<agent_id>.pid` for a subagent.
+Their locks sit next to them in `../locks/`, one directory per pidfile.
 
 ## Configuration
 
@@ -111,6 +129,7 @@ Every way a session can end has something that releases the suppression:
 | A subagent finishes | `SubagentStop` hook |
 | Claude Code is killed or crashes | macOS: `caffeinate -w` exits with it. Everywhere: the next `SessionStart` reap notices the dead pid |
 | A hook is killed before it records the holder | The next `SessionStart` reap sweeps holders that no pidfile claims, on Windows and Linux. macOS has no sweep: `caffeinate` carries no marker telling ours from one the user started by hand, so an unrecorded one falls back to `caffeinate -w` and then to its `-t` deadline |
+| A session closes while a background hook is still working | Claude Code kills the hook. That is the case above, and the interop round trip it dies in is the reason the window exists at all — which puts it on Windows and WSL2, where the sweep runs |
 | No hook fires at all | The holder's own `WAKEGUARD_MAX_HOURS` deadline. A `WAKEGUARD_CMD` holder gets neither this nor the sweep, since wakeguard can neither give a deadline to an arbitrary command nor recognize one it did not name |
 | `wsl --shutdown` | The Windows holder outlives the VM, and the next WSL session reaps it over interop |
 
@@ -119,11 +138,18 @@ to the holder it started — by command name on Unix, by the holder script's pat
 in the command line on Windows — so a recycled pid never gets an unrelated
 process killed.
 
-**Two gaps worth knowing about.** Interrupting a turn with Esc is not a `Stop`
+Half of the table leans on the reap, and the reap only runs when a session
+starts. Start no session, and a holder nobody released stays until its own
+`WAKEGUARD_MAX_HOURS` deadline.
+
+**Three gaps worth knowing about.** Interrupting a turn with Esc is not a `Stop`
 event, so the holder stays until the next turn ends or the session does. Until
 then the machine will not sleep on its own. Whether `SubagentStop` arrives when
 a subagent is interrupted along with the turn is unverified; if it does not, its
-holder stays just as long.
+holder stays just as long. And a `Stop` hook — anybody's, not wakeguard's — can
+block and hand the turn back to the model; no prompt is submitted for the
+continuation, so wakeguard has already counted the turn as over and released
+the holder while the model works on.
 
 And a Windows holder is recognized by the holder script's path, which carries
 the plugin version, so upgrading the plugin while a holder is running makes the
