@@ -574,9 +574,9 @@ foreach ($id in @(__WG_PIDS__)) {
 }
 POWERSHELL
   )"
-  script="${script//__WG_ACTION__/${action:-\"\$id ours\"}}"
   # The replacements are quoted so bash 5.2 does not read a & in them as
   # "insert the match here".
+  script="${script//__WG_ACTION__/"${action:-\"\$id ours\"}"}"
   script="${script//__WG_SCRIPT__/"'$ps1_win'"}"
   script="${script//__WG_FILTER__/"$filter"}"
   script="${script//__WG_PIDS__/"$(pid_list_to_csv "$pids")"}"
@@ -917,7 +917,7 @@ cmd_reap() {
   done
 
   flush_releases
-  windows_pids="$windows_pids$UNRESOLVED_PIDS"
+  windows_pids="$windows_pids $UNRESOLVED_PIDS"
   while [ "$locked" -gt 0 ]; do
     release_lock
     locked=$(( locked - 1 ))

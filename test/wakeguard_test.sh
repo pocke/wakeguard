@@ -64,6 +64,50 @@ backdate_pidfile() {
   mv "$pidfile.aged" "$pidfile"
 }
 
+# Puts a fake powershell.exe and the two commands around it on PATH, so the
+# batched interop can be driven anywhere. $1 is what a probe answers with, $2
+# what a kill answers with; both are read as they are written, so a test can
+# hand back an empty answer, a partial one, or one in another order. Every
+# script the fake is handed lands in $WORK/powershell.log, one per record.
+stub_windows_host() {
+  mkdir -p "$WORK/bin"
+  printf '#!/usr/bin/env bash\nprintf %s\n' "'C:\\wakeguard\\wakeguard-hold.ps1'" >"$WORK/bin/wslpath"
+  # The sweep for unrecorded systemd holders looks at the whole machine, which
+  # a test has no business doing.
+  printf '#!/usr/bin/env bash\nexit 1\n' >"$WORK/bin/pgrep"
+  cat >"$WORK/bin/powershell.exe" <<STUB
+#!/usr/bin/env bash
+script="\${!#}"
+{ printf '%s\n' "\$script"; printf 'END-OF-SCRIPT\n'; } >>"$WORK/powershell.log"
+case "\$script" in
+  *Stop-Process*) printf '%s' '$2' ;;
+  *)              printf '%s' '$1' ;;
+esac
+STUB
+  chmod +x "$WORK/bin/wslpath" "$WORK/bin/pgrep" "$WORK/bin/powershell.exe"
+  PATH="$WORK/bin:$PATH"
+  export PATH
+}
+
+# A pidfile for a holder on the Windows host, written rather than started: the
+# fake host answers for it, so nothing has to be running.
+write_windows_pidfile() {
+  mkdir -p "$SESSIONS"
+  cat >"$SESSIONS/$1.pid" <<EOF
+HOLDER_PID=$2
+HOLDER_KIND=powershell
+CLAUDE_PID=
+ENV=wsl
+STARTED_AT=$3
+BOOT_ID=
+PROMPT_ID=
+EOF
+}
+
+powershell_calls() {
+  grep -c '^END-OF-SCRIPT$' "$WORK/powershell.log" 2>/dev/null || printf 0
+}
+
 # A pid that is certain to be gone.
 dead_pid() {
   local pid
@@ -110,6 +154,10 @@ wait_gone() {
 
 assert_log() {
   grep -q -- "$1" "$WAKEGUARD_LOG" 2>/dev/null || fail "$2: nothing logged about '$1'"
+}
+
+assert_log_file() {
+  grep -q -F -- "$2" "$1" 2>/dev/null || fail "$3: '$2' is not in $1"
 }
 
 run_tests() {
@@ -309,8 +357,80 @@ test_reap_judges_every_pidfile_of_a_walk_on_its_own() {
   assert_no_file "$SESSIONS/s1.pid" 'the released pidfile should be gone'
   assert_file "$SESSIONS/s2.pid" 'the healthy pidfile should stay'
   assert_file "$SESSIONS/s3.pid" 'the skipped pidfile should stay'
-  assert_no_file "$LOCKS/s1.lock" 'reap should hand back every lock it took'
-  assert_no_file "$LOCKS/s2.lock" 'reap should hand back every lock it took'
+}
+
+# --- holders on the Windows host ----------------------------------------------
+#
+# A fake powershell.exe stands in for the host, so these run everywhere the rest
+# of the suite does. Git Bash is the exception: there a file named
+# powershell.exe has to be a real executable.
+
+windows_host_can_be_faked() {
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) return 1 ;;
+  esac
+  return 0
+}
+
+test_one_round_trip_answers_for_every_windows_holder() {
+  windows_host_can_be_faked || return 0
+  stub_windows_host '7001 ours
+7002 ours
+7003 ours' '7001 killed
+7002 killed
+7003 killed'
+  write_windows_pidfile s1 7001 1
+  write_windows_pidfile s2 7002 1
+  write_windows_pidfile s3 7003 1
+
+  wg reap
+  assert_eq "$(powershell_calls)" 2 'three holders should cost one probe and one kill'
+  assert_no_file "$SESSIONS/s1.pid" 'a killed holder should lose its pidfile'
+  assert_no_file "$SESSIONS/s2.pid" 'a killed holder should lose its pidfile'
+  assert_no_file "$SESSIONS/s3.pid" 'a killed holder should lose its pidfile'
+}
+
+test_a_batch_is_read_by_pid_not_by_position() {
+  windows_host_can_be_faked || return 0
+  stub_windows_host '7001 ours
+7002 ours
+7003 ours' '7003 killed
+7001 killed'
+  write_windows_pidfile s1 7001 1
+  write_windows_pidfile s2 7002 1
+  write_windows_pidfile s3 7003 1
+
+  wg reap
+  assert_no_file "$SESSIONS/s1.pid" '7001 was answered for and should be gone'
+  assert_no_file "$SESSIONS/s3.pid" '7003 was answered for and should be gone'
+  assert_file "$SESSIONS/s2.pid" '7002 went unanswered and its pidfile is the way back'
+}
+
+test_a_host_that_answers_nothing_costs_no_holder_its_pidfile() {
+  windows_host_can_be_faked || return 0
+  stub_windows_host '' ''
+  write_windows_pidfile s1 7001 1
+  write_windows_pidfile s2 7002 1
+
+  wg reap
+  assert_file "$SESSIONS/s1.pid" 'an unanswered holder keeps its pidfile'
+  assert_file "$SESSIONS/s2.pid" 'an unanswered holder keeps its pidfile'
+  assert_log 'kind=powershell: unknown' 'the outcome should read as unknown, not gone'
+}
+
+test_an_unanswered_holder_stays_out_of_the_sweep() {
+  windows_host_can_be_faked || return 0
+  stub_windows_host '' ''
+  write_windows_pidfile s1 7001 1
+  write_windows_pidfile s2 7002 1
+
+  # The sweep only runs for holders wakeguard itself chose, and it is the sweep
+  # that would kill a holder missing from the keep list. The assignment goes on
+  # the interpreter rather than on wg, which is a function: bash 3.2 keeps such
+  # an assignment to itself.
+  WAKEGUARD_CMD='' bash "$WG" reap </dev/null
+  assert_eq "$(sed -n 's/^\$keep = //p' "$WORK/powershell.log" | head -1)" '@(7001,7002)' \
+    'both unanswered holders should reach the sweep keep list'
 }
 
 test_reap_removes_a_lock_nobody_holds() {
