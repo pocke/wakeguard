@@ -289,6 +289,30 @@ test_reap_releases_a_holder_past_the_deadline() {
   assert_no_file "$SESSIONS/s1.pid" 'the pidfile should be gone after reap'
 }
 
+test_reap_judges_every_pidfile_of_a_walk_on_its_own() {
+  local expired healthy locked owner
+  wg start "$(turn s1 p1)"
+  wg start "$(turn s2 p1)"
+  wg start "$(turn s3 p1)"
+  expired="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
+  healthy="$(field "$SESSIONS/s2.pid" HOLDER_PID)"
+  locked="$(field "$SESSIONS/s3.pid" HOLDER_PID)"
+  backdate_pidfile "$SESSIONS/s1.pid" 90000
+  backdate_pidfile "$SESSIONS/s3.pid" 90000
+  owner="$(hold_lock s3)"
+  STRAYS+=("$owner")
+
+  wg reap
+  assert_dead "$expired" 'the holder past its deadline should be released'
+  assert_alive "$healthy" 'a holder still inside its deadline should be left alone'
+  assert_alive "$locked" 'a pidfile under somebody else lock should be skipped'
+  assert_no_file "$SESSIONS/s1.pid" 'the released pidfile should be gone'
+  assert_file "$SESSIONS/s2.pid" 'the healthy pidfile should stay'
+  assert_file "$SESSIONS/s3.pid" 'the skipped pidfile should stay'
+  assert_no_file "$LOCKS/s1.lock" 'reap should hand back every lock it took'
+  assert_no_file "$LOCKS/s2.lock" 'reap should hand back every lock it took'
+}
+
 test_reap_removes_a_lock_nobody_holds() {
   local lock="$LOCKS/s1.lock"
   mkdir -p "$lock"

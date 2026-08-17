@@ -543,23 +543,29 @@ unix_holder_state() {
 # the user opened.
 #
 # Reaching the Windows host costs several hundred milliseconds, and it costs the
-# same whether the question is about one holder or twenty, so the question is
-# asked about all of them at once. Answers "<pid> <state>" a line at a time, and
-# says nothing at all about a pid it could not reach a verdict on.
+# same whether the question is about one holder or twenty. Answers
+# "<pid> <state>" a line at a time, and says nothing at all about a pid it could
+# not reach a verdict on.
 windows_holders_probe() {
   local pids="$1" action="$2" ps1_win filter='' pid script
 
-  # An empty needle would make Contains match every powershell on the machine.
-  ps1_win="$(holder_script_winpath)" || return 0
   for pid in $pids; do
     filter="${filter:+$filter or }ProcessId=$pid"
   done
   [ -n "$filter" ] || return 0
+  # An empty needle would make Contains match every powershell on the machine.
+  ps1_win="$(holder_script_winpath)" || return 0
 
   script="$(cat <<'POWERSHELL'
 $found = @{}
-Get-CimInstance Win32_Process -Filter "__WG_FILTER__" |
-  ForEach-Object { $found[[string]$_.ProcessId] = $_ }
+try {
+  Get-CimInstance Win32_Process -Filter "__WG_FILTER__" -ErrorAction Stop |
+    ForEach-Object { $found[[string]$_.ProcessId] = $_ }
+} catch {
+  # Going on would leave $found empty and call every live holder gone, and gone
+  # is a verdict the caller acts on.
+  exit
+}
 foreach ($id in @(__WG_PIDS__)) {
   $p = $found[[string]$id]
   if (-not $p) { "$id gone" }
@@ -569,11 +575,11 @@ foreach ($id in @(__WG_PIDS__)) {
 POWERSHELL
   )"
   script="${script//__WG_ACTION__/${action:-\"\$id ours\"}}"
-  # The replacement is quoted so bash 5.2 does not read a & in the path as
+  # The replacements are quoted so bash 5.2 does not read a & in them as
   # "insert the match here".
   script="${script//__WG_SCRIPT__/"'$ps1_win'"}"
-  script="${script//__WG_FILTER__/$filter}"
-  script="${script//__WG_PIDS__/$(pid_list_to_csv "$pids")}"
+  script="${script//__WG_FILTER__/"$filter"}"
+  script="${script//__WG_PIDS__/"$(pid_list_to_csv "$pids")"}"
 
   powershell_eval "$script" | grep -E '^[0-9]+ (ours|killed|foreign|gone)$'
 }
@@ -593,11 +599,13 @@ state_of() {
   printf '%s' "${line#* }"
 }
 
-# What the walk over the pidfiles already asked the Windows host, so that no
-# path asks a second time for the same holder.
+# What the walk over the pidfiles already asked the Windows host, and which pids
+# it asked about, so that no path asks a second time for the same holder.
 WINDOWS_STATES=''
+WINDOWS_PROBED=''
 
 prefetch_windows_states() {
+  WINDOWS_PROBED=" $1 "
   WINDOWS_STATES="$(windows_holders_probe "$1" '')"
 }
 
@@ -605,9 +613,17 @@ windows_state() {
   local pid="$1" state
 
   is_pid "$pid" || { printf unknown; return; }
-  state="$(state_of "$WINDOWS_STATES" "$pid")" ||
-    state="$(state_of "$(windows_holders_probe "$pid" '')" "$pid")" ||
-    state=unknown
+  if state="$(state_of "$WINDOWS_STATES" "$pid")"; then
+    printf '%s' "$state"
+    return
+  fi
+  # A pid the batch was asked about and did not answer for is a pid the Windows
+  # host would not answer for twice either, and reap holds every lock it took
+  # while it waits.
+  case "$WINDOWS_PROBED" in
+    *" $pid "*) printf unknown; return ;;
+  esac
+  state="$(state_of "$(windows_holders_probe "$pid" '')" "$pid")" || state=unknown
   printf '%s' "$state"
 }
 
@@ -696,11 +712,15 @@ release_pidfile() {
 }
 
 # Holders waiting for one shared round trip to the Windows host, the pidfiles
-# that named them, and what each release is being logged as. Their locks stay
-# held until the batch has answered for them.
+# that named them, and what each release is being logged as. The three are read
+# by index, and their locks stay held until the batch has answered for them.
 PENDING_PIDS=()
 PENDING_PIDFILES=()
 PENDING_LABELS=()
+
+# The holders the batch would not answer for, which are still running as far as
+# anyone knows and so must stay out of the sweep's way.
+UNRESOLVED_PIDS=''
 
 pend_release() {
   PENDING_PIDFILES+=("$1")
@@ -711,6 +731,7 @@ pend_release() {
 flush_releases() {
   local answers count="${#PENDING_PIDS[@]}" i=0 pid outcome
 
+  UNRESOLVED_PIDS=''
   [ "$count" -gt 0 ] || return 0
   answers="$(windows_holders_release "${PENDING_PIDS[*]}")"
 
@@ -718,7 +739,7 @@ flush_releases() {
     pid="${PENDING_PIDS[i]}"
     outcome="$(state_of "$answers" "$pid")" || outcome=unknown
     apply_outcome "${PENDING_PIDFILES[i]}" "${PENDING_LABELS[i]}" \
-      "$pid" powershell "$outcome" || true
+      "$pid" powershell "$outcome" || UNRESOLVED_PIDS="$UNRESOLVED_PIDS $pid"
     i=$(( i + 1 ))
   done
   PENDING_PIDS=()
@@ -896,6 +917,7 @@ cmd_reap() {
   done
 
   flush_releases
+  windows_pids="$windows_pids$UNRESOLVED_PIDS"
   while [ "$locked" -gt 0 ]; do
     release_lock
     locked=$(( locked - 1 ))
