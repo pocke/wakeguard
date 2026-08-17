@@ -310,6 +310,7 @@ test_a_second_reap_does_nothing_while_the_first_runs() {
 test_a_reap_lock_nobody_signed_does_not_wedge_reap() {
   local pid
   mkdir -p "$LOCKS/reap+all.lock"
+  # GNU touch is the one that reads a relative -d, BSD touch the one with -A.
   touch -d '3 hours ago' "$LOCKS/reap+all.lock" 2>/dev/null ||
     touch -A -030000 "$LOCKS/reap+all.lock"
   wg start "$(turn s1 p1)"
