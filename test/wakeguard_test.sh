@@ -400,8 +400,7 @@ test_a_subagent_holder_waits_too() {
   wg agent-start '{"session_id":"s1","agent_id":"a1"}'
   agent_pid="$(field "$SESSIONS/s1.a1.pid" HOLDER_PID)"
 
-  # This is the release the reported gap opens on: the session is woken after
-  # it, not before.
+  # The gap opens on this release: the session is woken after it, not before.
   started="$(date '+%s')"
   WAKEGUARD_GRACE_SECONDS=3 bash "$WG" agent-stop <<<'{"session_id":"s1","agent_id":"a1"}'
   elapsed=$(( $(date '+%s') - started ))
@@ -411,17 +410,16 @@ test_a_subagent_holder_waits_too() {
 }
 
 test_the_session_ending_does_not_wait() {
-  local pid started elapsed
+  local pid
   wg start "$(turn s1 p1)"
   pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
 
-  started="$(date '+%s')"
+  # wait_gone gives up after ten seconds, so a release that waited thirty would
+  # leave the holder running here.
   WAKEGUARD_GRACE_SECONDS=30 wg end '{"session_id":"s1"}'
   wait_gone "$SESSIONS/s1.pid"
-  elapsed=$(( $(date '+%s') - started ))
 
   assert_dead "$pid" 'a session that is over is not waiting for anything'
-  [ "$elapsed" -lt 30 ] || fail "end should not wait: took ${elapsed}s"
 }
 
 test_a_wait_of_zero_releases_at_once() {
@@ -438,16 +436,60 @@ test_a_wait_of_zero_releases_at_once() {
 }
 
 test_a_wait_that_is_not_a_number_falls_back() {
+  local pid waiter
+  wg start "$(turn s1 p1)"
+  pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
+
+  WAKEGUARD_GRACE_SECONDS=soon bash "$WG" stop <<<"$(turn s1 p1)" 2>/dev/null &
+  waiter=$!
+  sleep 2
+  assert_alive "$pid" 'an unusable wait should fall back to the default, not to none'
+  assert_log 'using 60' 'and say what it fell back to'
+  # Cutting the sleep short lets the run finish on its own; killing the run
+  # instead would leave the sleep behind as an orphan.
+  pkill -P "$waiter" 2>/dev/null
+  wait "$waiter" 2>/dev/null
+}
+
+test_a_wait_longer_than_its_hook_falls_back() {
   local pid
   wg start "$(turn s1 p1)"
   pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
 
-  WAKEGUARD_GRACE_SECONDS=soon bash "$WG" stop <<<"$(turn s1 p1)" &
-  sleep 2
-  assert_alive "$pid" 'an unusable wait should fall back to the default, not to none'
-  kill %1 2>/dev/null
-  wait 2>/dev/null
-  assert_log 'is not a whole number of seconds' 'and say so'
+  WAKEGUARD_GRACE_SECONDS=100000 wg stop "$(turn s1 p1)"
+  assert_dead "$pid" 'a wait that would outlive its hook should not be taken'
+  assert_log 'using 60' 'and should say so'
+}
+
+test_the_wait_can_be_set_in_the_config_file() {
+  local pid
+  mkdir -p "$XDG_CONFIG_HOME/wakeguard"
+  printf 'WAKEGUARD_GRACE_SECONDS=0\n' >"$XDG_CONFIG_HOME/wakeguard/config"
+  wg start "$(turn s1 p1)"
+  pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
+
+  unset WAKEGUARD_GRACE_SECONDS
+  wg stop "$(turn s1 p1)"
+  export WAKEGUARD_GRACE_SECONDS=0
+  assert_dead "$pid" 'the config file should be read for the wait as for everything else'
+}
+
+test_a_holder_taken_over_during_the_wait_is_left_alone() {
+  local agent_pid
+  wg start "$(turn s1 p1)"
+  wg agent-start '{"session_id":"s1","agent_id":"a1"}'
+  agent_pid="$(field "$SESSIONS/s1.a1.pid" HOLDER_PID)"
+
+  # A subagent's stop carries no turn to pair with, so the pidfile itself is
+  # what says whether anything happened while this run waited.
+  WAKEGUARD_GRACE_SECONDS=3 bash "$WG" agent-stop <<<'{"session_id":"s1","agent_id":"a1"}' &
+  sleep 1
+  rm -f "$SESSIONS/s1.a1.pid"
+  wg agent-start '{"session_id":"s1","agent_id":"a1"}'
+  wait
+
+  assert_alive "$(field "$SESSIONS/s1.a1.pid" HOLDER_PID)" 'the holder recorded now should still be running'
+  assert_file "$SESSIONS/s1.a1.pid" 'and still be recorded'
 }
 
 # --- holders on the Windows host ----------------------------------------------

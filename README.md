@@ -82,18 +82,20 @@ pair them. Blocking is what keeps a subagent that fails immediately from having
 its `SubagentStop` overtake the `SubagentStart` still recording the holder,
 which would leave that holder with nothing to release it.
 
-A release waits a minute before it happens. A turn ending is not always a
-session finishing: ask for a subagent and the turn ends while it runs, and
-Claude Code comes back to the session when it is done. The subagent's own
-holder covers the run, but it goes with its `SubagentStop`, which lands before
-the session is woken — and the machine can fall asleep in that handover and
-never take the wake-up. Waiting to release covers it without wakeguard having
-to know what the session was waiting on, which is the only way to cover the
-wake-ups it cannot see coming: an API error ends a turn through `StopFailure`,
-which is told nothing about work in flight, and a `/loop` or a `ScheduleWakeup`
-fires from a schedule wakeguard does not read. A turn that starts inside the
-wait takes the holder over, and the `prompt_id` above is what keeps the waiting
-release from killing it on its way out.
+A turn's holder and a subagent's are released a minute after their hook says
+so. A turn ending is not always a session finishing: ask for a subagent and the
+turn ends while it runs, and Claude Code comes back to the session when it is
+done. The subagent's own holder covers the run, but it goes with its
+`SubagentStop`, which lands before the session is woken — and the machine can
+fall asleep in that handover and never take the wake-up. Waiting covers it
+without wakeguard having to know what the session was waiting on, which is what
+lets it cover the wake-ups it cannot see coming at all: an API error ends a
+turn through `StopFailure`, which is told nothing about work in flight, and a
+`/loop` or a `ScheduleWakeup` fires from a schedule wakeguard does not read —
+either is covered if it lands inside the wait, and neither is if it lands
+after. A turn that starts inside the wait takes the holder over, and the
+`prompt_id` above is what keeps the waiting release from killing it on its way
+out.
 
 The holder per environment:
 
@@ -146,6 +148,10 @@ bash <the path that printed> status
 To see the suppression from the operating system's side, run one of these while
 a turn is in progress:
 
+The suppression outlives the turn by `WAKEGUARD_GRACE_SECONDS`, so a holder
+found within a minute of one ending is one on its way out rather than one left
+behind.
+
 - macOS: `pmset -g assertions`, look for `PreventUserIdleSystemSleep`
 - Windows: `powercfg /requests` in an elevated prompt, look for `powershell`
   under `SYSTEM`. From WSL2, check this on the Windows host, not inside WSL
@@ -158,7 +164,7 @@ Every way a session can end has something that releases the suppression:
 |---|---|
 | Turn finishes, normally or on an API error | `Stop` / `StopFailure` hook, a `WAKEGUARD_GRACE_SECONDS` wait later |
 | Session ends with exit or Ctrl-C | `SessionEnd` hook, which clears every holder the session has, subagent holders included. A pidfile another wakeguard has locked at that moment is left to the reap |
-| A subagent finishes | `SubagentStop` hook |
+| A subagent finishes | `SubagentStop` hook, a `WAKEGUARD_GRACE_SECONDS` wait later — this is the release the machine used to fall asleep after |
 | Claude Code is killed or crashes | macOS: `caffeinate -w` exits with it. Everywhere: the next `SessionStart` reap notices the dead pid |
 | A hook is killed before it records the holder | The next `SessionStart` reap sweeps holders that no pidfile claims, on Windows and Linux. macOS has no sweep: `caffeinate` carries no marker telling ours from one the user started by hand, so an unrecorded one falls back to `caffeinate -w` and then to its `-t` deadline |
 | A session closes while a background hook is still working | Claude Code kills the hook — documented for `claude -p`, and the same in every run wakeguard was tested in. That leaves the case above, and the interop round trip the hook dies in is what makes the window wide enough to hit, which puts it on Windows and WSL2, where the sweep runs |
@@ -174,8 +180,7 @@ Half of the table leans on the reap, and the reap only runs when a session
 starts. Start no session, and a holder nobody released stays until its own
 `WAKEGUARD_MAX_HOURS` deadline.
 
-**Three gaps worth knowing about.** They all outlast the wait above, which is
-why they are gaps rather than moments. Interrupting a turn with Esc is not a `Stop`
+**Three gaps worth knowing about.** Interrupting a turn with Esc is not a `Stop`
 event, so the holder stays until the next turn ends or the session does. Until
 then the machine will not sleep on its own. Whether `SubagentStop` arrives when
 a subagent is interrupted along with the turn is unverified; if it does not, its

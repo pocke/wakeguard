@@ -36,7 +36,7 @@ load_config() {
     while IFS= read -r line || [ -n "$line" ]; do
       line="${line%$'\r'}"
       case "$line" in
-        WAKEGUARD_CMD=*|WAKEGUARD_DISPLAY=*|WAKEGUARD_MAX_HOURS=*|WAKEGUARD_LOG=*) ;;
+        WAKEGUARD_CMD=*|WAKEGUARD_DISPLAY=*|WAKEGUARD_MAX_HOURS=*|WAKEGUARD_LOG=*|\
         WAKEGUARD_GRACE_SECONDS=*) ;;
         *) continue ;;
       esac
@@ -80,15 +80,19 @@ normalize_max_hours() {
   WAKEGUARD_MAX_HOURS="$value"
 }
 
-# A value that is not a number would make the wait either never end or never
-# happen, and both are worse than the default.
+# The upper bound is what the hooks that wait allow themselves, less the time
+# the release itself can take: a wait that outlives its hook is a holder nobody
+# releases. `sleep inf` is the value that would never come back at all.
+GRACE_MAX_SECONDS=240
+
 normalize_grace_seconds() {
   case "$WAKEGUARD_GRACE_SECONDS" in
-    ''|*[!0-9]*)
-      log "WAKEGUARD_GRACE_SECONDS=$WAKEGUARD_GRACE_SECONDS is not a whole number of seconds, using 60"
-      WAKEGUARD_GRACE_SECONDS=60
-      ;;
+    ''|*[!0-9]*) ;;
+    *) [ "$WAKEGUARD_GRACE_SECONDS" -le "$GRACE_MAX_SECONDS" ] && return 0 ;;
   esac
+
+  log "WAKEGUARD_GRACE_SECONDS=$WAKEGUARD_GRACE_SECONDS is not a whole number of seconds in [0, $GRACE_MAX_SECONDS], using 60"
+  WAKEGUARD_GRACE_SECONDS=60
 }
 
 max_hours_seconds() {
@@ -767,24 +771,22 @@ flush_releases() {
   PENDING_LABELS=()
 }
 
-# Nothing marks the moment Claude Code comes back to a session that was waiting
-# on something, and by then the holder that covered the wait is gone: a
-# subagent's own holder goes with its SubagentStop, which lands before the
-# session is woken. Waiting to release covers the handover, whatever the session
-# was waiting on and whatever wakes it.
+# A subagent's holder goes with its SubagentStop, and that lands before Claude
+# Code comes back to the session the subagent was running for. Nothing marks the
+# moment it does come back, so the release waits instead.
 #
-# A turn that starts inside the wait takes the holder over, and the prompt id is
-# what stops this run from killing it on the way out. The hook is async, so the
-# wait costs the turn nothing.
+# The wait happens before the lock: holding one for a minute would have the next
+# turn's start give up on it, and reap take it for abandoned.
 grace_wait() {
   [ "$WAKEGUARD_GRACE_SECONDS" != 0 ] || return 0
   sleep "$WAKEGUARD_GRACE_SECONDS"
 }
 
 cmd_stop() {
-  local key="$1" prompt_id="$2" pidfile
+  local key="$1" prompt_id="$2" pidfile recorded
   pidfile="$(pidfile_path "$key")"
 
+  recorded="$(cat "$pidfile" 2>/dev/null)"
   grace_wait
   acquire_lock "$key" "$LOCK_WAIT_SECONDS" ||
     { log "stop $key: the lock stayed taken, leaving the holder to end and reap"; return 0; }
@@ -792,6 +794,12 @@ cmd_stop() {
   if ! read_pidfile "$pidfile"; then
     log "stop $key: no holder pid recorded"
     rm -f "$pidfile" 2>/dev/null || true
+    return 0
+  fi
+  # Whoever wrote the pidfile while this run waited holds what it names now, and
+  # a subagent's stop has no turn id to work that out with.
+  if [ "$recorded" != "$(cat "$pidfile" 2>/dev/null)" ]; then
+    log "stop $key: the holder was taken over while this run waited, leaving it"
     return 0
   fi
   # Hooks reach here out of order, so a mismatch means a later turn already took
