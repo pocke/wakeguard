@@ -80,19 +80,21 @@ normalize_max_hours() {
   WAKEGUARD_MAX_HOURS="$value"
 }
 
-# The upper bound is what the hooks that wait allow themselves, less the time
-# the release itself can take: a wait that outlives its hook is a holder nobody
-# releases. `sleep inf` is the value that would never come back at all.
+# The hooks that wait allow themselves 300 seconds in hooks/hooks.json, and what
+# follows the wait can take a lock wait (LOCK_WAIT_SECONDS) and a round trip to
+# the Windows host. A wait that outlives its hook is a holder nobody releases.
 GRACE_MAX_SECONDS=240
 
+# `sleep inf` is the value that would wait forever; everything else that is not
+# a number makes sleep fail and the wait vanish.
 normalize_grace_seconds() {
   case "$WAKEGUARD_GRACE_SECONDS" in
     ''|*[!0-9]*) ;;
-    *) [ "$WAKEGUARD_GRACE_SECONDS" -le "$GRACE_MAX_SECONDS" ] && return 0 ;;
+    *) [ "$WAKEGUARD_GRACE_SECONDS" -le "$GRACE_MAX_SECONDS" ] 2>/dev/null && return 0 ;;
   esac
 
-  log "WAKEGUARD_GRACE_SECONDS=$WAKEGUARD_GRACE_SECONDS is not a whole number of seconds in [0, $GRACE_MAX_SECONDS], using 60"
   WAKEGUARD_GRACE_SECONDS=60
+  log "WAKEGUARD_GRACE_SECONDS is not a whole number of seconds in [0, $GRACE_MAX_SECONDS], using $WAKEGUARD_GRACE_SECONDS"
 }
 
 max_hours_seconds() {
@@ -246,6 +248,10 @@ write_pidfile() {
       printf 'STARTED_AT=%s\n' "$STARTED_AT"
       printf 'BOOT_ID=%s\n' "$BOOT_ID"
       printf 'PROMPT_ID=%s\n' "$PROMPT_ID"
+      # A holder handed to a second subagent under the same id is recorded with
+      # everything else unchanged, and a release that waited has only the file
+      # to tell it that happened.
+      printf 'WRITTEN_BY=%s\n' "$$"
     } >"$tmp" &&
       mv -f "$tmp" "$file"
   } 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
@@ -778,7 +784,7 @@ flush_releases() {
 # The wait happens before the lock: holding one for a minute would have the next
 # turn's start give up on it, and reap take it for abandoned.
 grace_wait() {
-  [ "$WAKEGUARD_GRACE_SECONDS" != 0 ] || return 0
+  [ "$WAKEGUARD_GRACE_SECONDS" -ne 0 ] || return 0
   sleep "$WAKEGUARD_GRACE_SECONDS"
 }
 

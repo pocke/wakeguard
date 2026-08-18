@@ -93,9 +93,11 @@ lets it cover the wake-ups it cannot see coming at all: an API error ends a
 turn through `StopFailure`, which is told nothing about work in flight, and a
 `/loop` or a `ScheduleWakeup` fires from a schedule wakeguard does not read —
 either is covered if it lands inside the wait, and neither is if it lands
-after. A turn that starts inside the wait takes the holder over, and the
-`prompt_id` above is what keeps the waiting release from killing it on its way
-out.
+after. Whatever takes the holder over inside the wait — the turn Claude Code
+opens on the wake-up, or a second subagent — leaves the pidfile rewritten, and
+a release that finds it rewritten leaves the holder alone. That is what makes a
+late release safe where `prompt_id` cannot reach: a subagent's stop names no
+turn at all.
 
 The holder per environment:
 
@@ -131,7 +133,7 @@ the file.
 | `WAKEGUARD_CMD` | Run this command as the holder instead of the one picked by environment detection, e.g. `caffeinate -dims`. Split on whitespace, so quoting an argument does not work | unset |
 | `WAKEGUARD_DISPLAY` | `1` keeps the display on as well (`caffeinate -d` / `-KeepDisplayOn`). No effect on Linux | `0` |
 | `WAKEGUARD_MAX_HOURS` | How long a holder may live before it gives up on its own. A number in [0.001, 168]; anything else falls back to the default | `8` |
-| `WAKEGUARD_GRACE_SECONDS` | How long a release waits, so that a session woken by work it was waiting on still finds the machine awake. `0` releases at once. Keep it under the hook's own timeout — five minutes, in the hooks this plugin ships — or the release is killed before it happens and left to `SessionEnd` | `60` |
+| `WAKEGUARD_GRACE_SECONDS` | How long a release waits, so that a session woken by work it was waiting on finds the machine awake until it is going again. `0` releases at once. Anything above 240 falls back to the default, to keep the wait inside the timeout of the hook that has to survive it | `60` |
 | `WAKEGUARD_LOG` | Append diagnostics to this file. Nothing is written anywhere without it, and a background hook's output never reaches the terminal, so this is the only way to watch what wakeguard did | unset |
 
 ## Checking that it works
@@ -148,13 +150,12 @@ bash <the path that printed> status
 To see the suppression from the operating system's side, run one of these while
 a turn is in progress:
 
-The suppression outlives the turn by `WAKEGUARD_GRACE_SECONDS`, so a holder
-found within a minute of one ending is one on its way out rather than one left
-behind.
-
 - macOS: `pmset -g assertions`, look for `PreventUserIdleSystemSleep`
 - Windows: `powercfg /requests` in an elevated prompt, look for `powershell`
   under `SYSTEM`. From WSL2, check this on the Windows host, not inside WSL
+
+The suppression outlives the turn by `WAKEGUARD_GRACE_SECONDS`, so a holder
+found within a minute of one ending is on its way out rather than left behind.
 
 ## Never leaving the machine awake
 

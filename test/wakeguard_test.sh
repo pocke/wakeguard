@@ -452,13 +452,17 @@ test_a_wait_that_is_not_a_number_falls_back() {
 }
 
 test_a_wait_longer_than_its_hook_falls_back() {
-  local pid
+  local pid waiter
   wg start "$(turn s1 p1)"
   pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
 
-  WAKEGUARD_GRACE_SECONDS=100000 wg stop "$(turn s1 p1)"
-  assert_dead "$pid" 'a wait that would outlive its hook should not be taken'
-  assert_log 'using 60' 'and should say so'
+  WAKEGUARD_GRACE_SECONDS=100000 bash "$WG" stop <<<"$(turn s1 p1)" 2>/dev/null &
+  waiter=$!
+  sleep 2
+  assert_alive "$pid" 'the fallback should still be a wait'
+  assert_log 'using 60' 'of sixty seconds, not of the value asked for'
+  pkill -P "$waiter" 2>/dev/null
+  wait "$waiter" 2>/dev/null
 }
 
 test_the_wait_can_be_set_in_the_config_file() {
@@ -468,10 +472,15 @@ test_the_wait_can_be_set_in_the_config_file() {
   wg start "$(turn s1 p1)"
   pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
 
+  local started elapsed
   unset WAKEGUARD_GRACE_SECONDS
+  started="$(date '+%s')"
   wg stop "$(turn s1 p1)"
+  elapsed=$(( $(date '+%s') - started ))
   export WAKEGUARD_GRACE_SECONDS=0
+
   assert_dead "$pid" 'the config file should be read for the wait as for everything else'
+  [ "$elapsed" -lt 3 ] || fail "the file said not to wait, and it waited ${elapsed}s"
 }
 
 test_a_holder_taken_over_during_the_wait_is_left_alone() {
@@ -484,7 +493,8 @@ test_a_holder_taken_over_during_the_wait_is_left_alone() {
   # what says whether anything happened while this run waited.
   WAKEGUARD_GRACE_SECONDS=3 bash "$WG" agent-stop <<<'{"session_id":"s1","agent_id":"a1"}' &
   sleep 1
-  rm -f "$SESSIONS/s1.a1.pid"
+  # The same id again: the record it leaves says the same things as the one this
+  # release read, apart from who wrote it.
   wg agent-start '{"session_id":"s1","agent_id":"a1"}'
   wait
 
