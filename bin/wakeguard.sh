@@ -4,6 +4,7 @@ set -u
 
 STATE_DIR="${XDG_STATE_HOME:-${HOME:-}/.local/state}/wakeguard"
 SESSIONS_DIR="$STATE_DIR/sessions"
+LOCKS_DIR="$STATE_DIR/locks"
 CONFIG_FILE="${XDG_CONFIG_HOME:-${HOME:-}/.config}/wakeguard/config"
 
 usage() {
@@ -141,6 +142,14 @@ powershell_bin() {
   printf '%s' "$fallback"
 }
 
+# Puts $3 where $1 first says $2. ${text//name/value} cannot do this across the
+# bash versions wakeguard runs on: 5.2 reads a & in the value as the text that
+# matched, and 3.2 keeps quotes meant to stop it.
+fill_in() {
+  local text="$1" name="$2" value="$3"
+  printf '%s%s%s' "${text%%"$name"*}" "$value" "${text#*"$name"}"
+}
+
 powershell_eval() {
   local bin
   bin="$(powershell_bin)" || return 1
@@ -185,10 +194,10 @@ pidfile_session() {
 }
 
 # Sets HOLDER_PID / HOLDER_KIND / CLAUDE_PID / HOLDER_ENV / STARTED_AT /
-# BOOT_ID, and fails when there is no holder pid to act on.
+# BOOT_ID / PROMPT_ID, and fails when there is no holder pid to act on.
 read_pidfile() {
   local file="$1" key value
-  HOLDER_PID='' HOLDER_KIND='' CLAUDE_PID='' HOLDER_ENV='' STARTED_AT='' BOOT_ID=''
+  HOLDER_PID='' HOLDER_KIND='' CLAUDE_PID='' HOLDER_ENV='' STARTED_AT='' BOOT_ID='' PROMPT_ID=''
 
   [ -r "$file" ] || return 1
   while IFS='=' read -r key value; do
@@ -199,6 +208,7 @@ read_pidfile() {
       ENV) HOLDER_ENV="$value" ;;
       STARTED_AT) STARTED_AT="$value" ;;
       BOOT_ID) BOOT_ID="$value" ;;
+      PROMPT_ID) PROMPT_ID="$value" ;;
     esac
   done <"$file"
 
@@ -217,6 +227,7 @@ write_pidfile() {
       printf 'ENV=%s\n' "$HOLDER_ENV"
       printf 'STARTED_AT=%s\n' "$STARTED_AT"
       printf 'BOOT_ID=%s\n' "$BOOT_ID"
+      printf 'PROMPT_ID=%s\n' "$PROMPT_ID"
     } >"$tmp" &&
       mv -f "$tmp" "$file"
   } 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
@@ -227,6 +238,104 @@ is_pid() {
     ''|0|*[!0-9]*) return 1 ;;
   esac
   return 0
+}
+
+# --- locking ------------------------------------------------------------------
+#
+# Everything that touches a pidfile holds its lock.
+
+LOCK_WAIT_SECONDS="${WAKEGUARD_LOCK_WAIT_SECONDS:-20}"
+# A holder that lives through a whole session is expected; a wakeguard run that
+# does is not.
+LOCK_STALE_SECONDS=120
+LOCK_POLL_SECONDS=0.2
+
+HELD_LOCKS=()
+
+lock_path() {
+  printf '%s/%s.lock' "$LOCKS_DIR" "$1"
+}
+
+# Waits up to $2 seconds for the lock named $1. Fails when the wait runs out.
+acquire_lock() {
+  local name="$1" wait_seconds="$2" lock deadline
+  lock="$(lock_path "$name")"
+  deadline=$(( $(date '+%s') + wait_seconds ))
+
+  (umask 077 && mkdir -p "$LOCKS_DIR") 2>/dev/null || return 1
+  while :; do
+    if mkdir "$lock" 2>/dev/null; then
+      # A lock nobody can be identified through is one nobody can hand back,
+      # so failing to sign it is failing to take it.
+      # The 2>/dev/null comes first so that the redirection failing is quiet.
+      if printf '%s %s\n' "$$" "$(date '+%s')" 2>/dev/null >"$lock/owner"; then
+        HELD_LOCKS+=("$lock")
+        return 0
+      fi
+      rmdir "$lock" 2>/dev/null
+      return 1
+    fi
+
+    lock_is_stale "$lock" && steal_lock "$lock" && continue
+    [ "$(date '+%s')" -lt "$deadline" ] || return 1
+    sleep "$LOCK_POLL_SECONDS" 2>/dev/null || sleep 1
+  done
+}
+
+# A hook is killed when its session's process exits, so a lock whose owner is
+# gone is an ordinary leftover rather than a sign of a crash.
+lock_is_stale() {
+  local lock="$1" owner pid taken_at
+
+  owner="$(cat "$lock/owner" 2>/dev/null)"
+  pid="${owner%% *}"
+  taken_at="${owner##* }"
+  case "$taken_at" in ''|*[!0-9]*) taken_at='' ;; esac
+
+  # Between the mkdir that takes a lock and the line that signs it, and again
+  # between unsigning it and removing it, a lock says nothing about who holds
+  # it. Its own age is then the only thing that tells a live one from a corpse.
+  if ! is_pid "$pid" || [ -z "$taken_at" ]; then
+    [ -n "$(find "$lock" -maxdepth 0 -mmin "+$(( LOCK_STALE_SECONDS / 60 ))" 2>/dev/null)" ]
+    return
+  fi
+
+  kill -0 "$pid" 2>/dev/null || return 0
+  # The pid may have been recycled by an unrelated process.
+  [ "$(( $(date '+%s') - 10#$taken_at ))" -gt "$LOCK_STALE_SECONDS" ]
+}
+
+# Renaming is atomic, so of the processes that give up on one lock at the same
+# moment only one gets to clear it away.
+steal_lock() {
+  local lock="$1" taken="$1.stale.$$"
+
+  mv "$lock" "$taken" 2>/dev/null || return 1
+  rm -rf "$taken" 2>/dev/null
+  log "took over the abandoned lock $lock"
+}
+
+release_lock() {
+  local count="${#HELD_LOCKS[@]}" lock owner
+
+  [ "$count" -gt 0 ] || return 0
+  lock="${HELD_LOCKS[count - 1]}"
+  unset 'HELD_LOCKS[count - 1]'
+
+  owner="$(cat "$lock/owner" 2>/dev/null)"
+  if [ "${owner%% *}" != "$$" ]; then
+    # Losing the lock means the pidfile was open to somebody else all along.
+    log "the lock $lock was taken from us"
+    return 0
+  fi
+  rm -f "$lock/owner" 2>/dev/null
+  rmdir "$lock" 2>/dev/null
+}
+
+release_locks() {
+  while [ "${#HELD_LOCKS[@]}" -gt 0 ]; do
+    release_lock
+  done
 }
 
 # Changes on every boot, so a pidfile written before a reboot can be told apart
@@ -410,7 +519,7 @@ holder_is_windows() {
 
 holder_state() {
   if holder_is_windows; then
-    windows_holder_probe ''
+    windows_state "$HOLDER_PID"
   else
     unix_holder_state
   fi
@@ -439,27 +548,89 @@ unix_holder_state() {
 
 # Every powershell.exe on the machine answers to ProcessName "powershell", so
 # only the holder script in its command line tells ours apart from a session
-# the user opened. Answering in the same trip that kills keeps stop down to one
-# interop round trip, which costs several hundred milliseconds.
-windows_holder_probe() {
-  local action="$1" ps1_win script out
+# the user opened.
+#
+# Reaching the Windows host costs several hundred milliseconds, and it costs the
+# same whether the question is about one holder or twenty. Answers
+# "<pid> <state>" a line at a time, and says nothing at all about a pid it could
+# not reach a verdict on.
+windows_holders_probe() {
+  local pids="$1" action="$2" ps1_win filter='' pid script
 
-  is_pid "$HOLDER_PID" || { printf unknown; return; }
+  for pid in $pids; do
+    filter="${filter:+$filter or }ProcessId=$pid"
+  done
+  [ -n "$filter" ] || return 0
   # An empty needle would make Contains match every powershell on the machine.
-  ps1_win="$(holder_script_winpath)" || { printf unknown; return; }
+  ps1_win="$(holder_script_winpath)" || return 0
 
-  script='$p = Get-CimInstance Win32_Process -Filter "ProcessId=__WG_PID__"
-if (-not $p) { "gone" }
-elseif ($p.CommandLine -and $p.CommandLine.Contains(__WG_SCRIPT__)) { __WG_ACTION__ }
-else { "foreign" }'
-  script="${script//__WG_ACTION__/${action:-\"ours\"}}"
-  # The replacement is quoted so bash 5.2 does not read a & in the path as
-  # "insert the match here".
-  script="${script//__WG_SCRIPT__/"'$ps1_win'"}"
-  script="${script//__WG_PID__/$HOLDER_PID}"
+  script="$(cat <<'POWERSHELL'
+$found = @{}
+try {
+  Get-CimInstance Win32_Process -Filter "__WG_FILTER__" -ErrorAction Stop |
+    ForEach-Object { $found[[string]$_.ProcessId] = $_ }
+} catch {
+  # Going on would leave $found empty and call every live holder gone, and gone
+  # is a verdict the caller acts on.
+  exit
+}
+foreach ($id in @(__WG_PIDS__)) {
+  $p = $found[[string]$id]
+  if (-not $p) { "$id gone" }
+  elseif ($p.CommandLine -and $p.CommandLine.Contains(__WG_SCRIPT__)) { __WG_ACTION__ }
+  else { "$id foreign" }
+}
+POWERSHELL
+  )"
+  script="$(fill_in "$script" __WG_ACTION__ "${action:-\"\$id ours\"}")"
+  script="$(fill_in "$script" __WG_SCRIPT__ "'$ps1_win'")"
+  script="$(fill_in "$script" __WG_FILTER__ "$filter")"
+  script="$(fill_in "$script" __WG_PIDS__ "$(pid_list_to_csv "$pids")")"
 
-  out="$(powershell_eval "$script" | grep -E '^(ours|killed|foreign|gone)$' | head -n 1)"
-  printf '%s' "${out:-unknown}"
+  powershell_eval "$script" | grep -E '^[0-9]+ (ours|killed|foreign|gone)$'
+}
+
+# Kills every holder in $1 in one round trip. A Stop-Process that is refused
+# would otherwise end the loop and leave the rest of the pids unanswered, and a
+# refusal means the holder is still running, which is not "killed".
+windows_holders_release() {
+  windows_holders_probe "$1" \
+    'try { Stop-Process -Id $id -Force -ErrorAction Stop; "$id killed" } catch { }'
+}
+
+# What a batch answered about one pid, or nothing when it did not answer.
+state_of() {
+  local answers="$1" pid="$2" line
+  line="$(printf '%s\n' "$answers" | grep -m 1 -E "^$pid ")" || return 1
+  printf '%s' "${line#* }"
+}
+
+# What the walk over the pidfiles already asked the Windows host, and which pids
+# it asked about, so that no path asks a second time for the same holder.
+WINDOWS_STATES=''
+WINDOWS_PROBED=''
+
+prefetch_windows_states() {
+  WINDOWS_PROBED=" $1 "
+  WINDOWS_STATES="$(windows_holders_probe "$1" '')"
+}
+
+windows_state() {
+  local pid="$1" state
+
+  is_pid "$pid" || { printf unknown; return; }
+  if state="$(state_of "$WINDOWS_STATES" "$pid")"; then
+    printf '%s' "$state"
+    return
+  fi
+  # A pid the batch was asked about and did not answer for is a pid the Windows
+  # host would not answer for twice either, and reap holds every lock it took
+  # while it waits.
+  case "$WINDOWS_PROBED" in
+    *" $pid "*) printf unknown; return ;;
+  esac
+  state="$(state_of "$(windows_holders_probe "$pid" '')" "$pid")" || state=unknown
+  printf '%s' "$state"
 }
 
 # Kills the holder when it is still ours, and reports what happened using the
@@ -468,9 +639,9 @@ holder_release() {
   local state
 
   if holder_is_windows; then
-    # -ErrorAction Stop: without it a refused Stop-Process is non-terminating
-    # and "killed" would be reported for a holder that is still running.
-    windows_holder_probe 'Stop-Process -Id __WG_PID__ -Force -ErrorAction Stop; "killed"'
+    state="$(state_of "$(windows_holders_release "$HOLDER_PID")" "$HOLDER_PID")" ||
+      state=unknown
+    printf '%s' "$state"
     return
   fi
 
@@ -483,15 +654,29 @@ holder_release() {
 # --- subcommands ------------------------------------------------------------
 
 cmd_start() {
-  local session_id="$1" pidfile state
+  local key="$1" prompt_id="$2" pidfile state
 
-  pidfile="$(pidfile_path "$session_id")"
+  pidfile="$(pidfile_path "$key")"
+  acquire_lock "$key" "$LOCK_WAIT_SECONDS" ||
+    { log "start $key: the lock stayed taken, doing nothing"; return 0; }
+
   if read_pidfile "$pidfile"; then
     state="$(holder_state)"
     # Starting a second holder for a state we could not read would leave the
     # first one with nothing recording it.
     if [ "$state" = ours ] || [ "$state" = unknown ]; then
-      log "holder for session=$session_id pid=$HOLDER_PID is $state, leaving it"
+      # Recording this turn is what keeps its own stop from killing a holder
+      # that a later turn has taken over. STARTED_AT stays as it was, so reap
+      # goes on measuring the holder's age against WAKEGUARD_MAX_HOURS.
+      PROMPT_ID="$prompt_id"
+      if write_pidfile "$pidfile"; then
+        log "start $key: holder pid=$HOLDER_PID is $state, keeping it for prompt=$prompt_id"
+      else
+        # A holder still recorded against the turn before this one is a holder
+        # this turn's stop will refuse to touch.
+        log "start $key: cannot update $pidfile"
+        release_pidfile "$pidfile" "start $key" || true
+      fi
       return 0
     fi
   fi
@@ -501,6 +686,7 @@ cmd_start() {
   HOLDER_ENV="$(detect_env)"
   CLAUDE_PID="$(claude_pid)"
   BOOT_ID="$(boot_id)"
+  PROMPT_ID="$prompt_id"
 
   start_holder "$CLAUDE_PID" || return 0
   is_pid "$HOLDER_PID" || { log 'holder gave no pid'; return 0; }
@@ -510,47 +696,139 @@ cmd_start() {
     holder_release >/dev/null
     return 0
   fi
-  log "started holder pid=$HOLDER_PID kind=$HOLDER_KIND session=$session_id"
+  log "started holder pid=$HOLDER_PID kind=$HOLDER_KIND session=$key prompt=$prompt_id"
 }
 
-# Releases the holder that read_pidfile has already loaded, then drops the
-# pidfile. Fails, and keeps the pidfile, when the holder's fate could not be
-# determined: the pidfile is the only way back to it.
-release_pidfile() {
-  local pidfile="$1" label="$2" outcome
+# Records what became of a holder and drops the pidfile that named it. Fails,
+# and keeps the pidfile, when the holder's fate could not be determined: the
+# pidfile is the only way back to it.
+apply_outcome() {
+  local pidfile="$1" label="$2" pid="$3" kind="$4" outcome="$5"
 
-  outcome="$(holder_release)"
-  log "$label holder=$HOLDER_PID kind=$HOLDER_KIND: $outcome"
+  log "$label holder=$pid kind=$kind: $outcome"
   [ "$outcome" != unknown ] || return 1
   rm -f "$pidfile" 2>/dev/null || true
 }
 
+# Releases the holder that read_pidfile has already loaded.
+release_pidfile() {
+  local pidfile="$1" label="$2"
+
+  apply_outcome "$pidfile" "$label" "$HOLDER_PID" "$HOLDER_KIND" "$(holder_release)"
+}
+
+# Holders waiting for one shared round trip to the Windows host, the pidfiles
+# that named them, and what each release is being logged as. The three are read
+# by index, and their locks stay held until the batch has answered for them.
+PENDING_PIDS=()
+PENDING_PIDFILES=()
+PENDING_LABELS=()
+
+# The holders the batch would not answer for, which are still running as far as
+# anyone knows and so must stay out of the sweep's way.
+UNRESOLVED_PIDS=''
+
+pend_release() {
+  PENDING_PIDFILES+=("$1")
+  PENDING_LABELS+=("$2")
+  PENDING_PIDS+=("$HOLDER_PID")
+}
+
+flush_releases() {
+  local answers count="${#PENDING_PIDS[@]}" i=0 pid outcome
+
+  UNRESOLVED_PIDS=''
+  [ "$count" -gt 0 ] || return 0
+  answers="$(windows_holders_release "${PENDING_PIDS[*]}")"
+
+  while [ "$i" -lt "$count" ]; do
+    pid="${PENDING_PIDS[i]}"
+    outcome="$(state_of "$answers" "$pid")" || outcome=unknown
+    apply_outcome "${PENDING_PIDFILES[i]}" "${PENDING_LABELS[i]}" \
+      "$pid" powershell "$outcome" || UNRESOLVED_PIDS="$UNRESOLVED_PIDS $pid"
+    i=$(( i + 1 ))
+  done
+  PENDING_PIDS=()
+  PENDING_PIDFILES=()
+  PENDING_LABELS=()
+}
+
 cmd_stop() {
-  local session_id="$1" pidfile
-  pidfile="$(pidfile_path "$session_id")"
+  local key="$1" prompt_id="$2" pidfile
+  pidfile="$(pidfile_path "$key")"
+
+  acquire_lock "$key" "$LOCK_WAIT_SECONDS" ||
+    { log "stop $key: the lock stayed taken, leaving the holder to end and reap"; return 0; }
 
   if ! read_pidfile "$pidfile"; then
-    log "stop session=$session_id: no holder pid recorded"
+    log "stop $key: no holder pid recorded"
     rm -f "$pidfile" 2>/dev/null || true
     return 0
   fi
-  release_pidfile "$pidfile" "stop session=$session_id" || true
+  # Hooks reach here out of order, so a mismatch means a later turn already took
+  # the holder over. Either side missing an id leaves the two impossible to
+  # pair, and the holder is released.
+  if [ -n "$PROMPT_ID" ] && [ -n "$prompt_id" ] && [ "$PROMPT_ID" != "$prompt_id" ]; then
+    log "stop $key: holder belongs to prompt=$PROMPT_ID, not $prompt_id, leaving it"
+    return 0
+  fi
+  release_pidfile "$pidfile" "stop $key" || true
 }
+
+# Every SessionEnd hook on the machine shares a budget of 1.5 seconds, and a
+# plugin's own timeout does not raise it:
+# https://code.claude.com/docs/en/hooks#sessionend
+# One round trip to the Windows host is a third of that before any other hook
+# has run, and a lock this run has to wait for is more. The hook therefore hands
+# the work to a process that outlives it, which is what the same page recommends
+# for anything that has to survive the session.
+detach_end() {
+  local session_id="$1" detached
+
+  run_detached env "WAKEGUARD_END_SESSION=$session_id" bash "$0" end
+  detached="$HOLDER_PID"
+  log "end $session_id: handed over to pid=$detached"
+}
+
+# The waiting is capped for the whole run rather than per pidfile, so a session
+# with several holders cannot spend its time on the first lock it finds taken.
+END_LOCK_BUDGET_SECONDS=3
 
 # Everything this session recorded, not just its turn holder. Subagent holders
 # outlive the turn that started them on purpose, so only the end of the session
 # may sweep them up.
 cmd_end() {
-  local session_id="$1" pidfile
+  local session_id="$1" pidfile session deadline remaining locked=0
+  deadline=$(( $(date '+%s') + END_LOCK_BUDGET_SECONDS ))
 
-  for pidfile in "$SESSIONS_DIR/$session_id".*.pid "$(pidfile_path "$session_id")"; do
+  # The turn holder goes first: it is the one a lock this run never gets would
+  # leave suppressing sleep with nothing but reap to notice.
+  for pidfile in "$(pidfile_path "$session_id")" "$SESSIONS_DIR/$session_id".*.pid; do
     [ -e "$pidfile" ] || continue
-    if ! read_pidfile "$pidfile"; then
-      log "end $(pidfile_session "$pidfile"): no holder pid recorded"
-      rm -f "$pidfile" 2>/dev/null || true
+    session="$(pidfile_session "$pidfile")"
+
+    remaining=$(( deadline - $(date '+%s') ))
+    [ "$remaining" -ge 0 ] || remaining=0
+    if ! acquire_lock "$session" "$remaining"; then
+      log "end $session: the lock stayed taken, leaving the holder to reap"
       continue
     fi
-    release_pidfile "$pidfile" "end $(pidfile_session "$pidfile")" || true
+    locked=$(( locked + 1 ))
+
+    if ! read_pidfile "$pidfile"; then
+      log "end $session: no holder pid recorded"
+      rm -f "$pidfile" 2>/dev/null || true
+    elif holder_is_windows; then
+      pend_release "$pidfile" "end $session"
+    else
+      release_pidfile "$pidfile" "end $session" || true
+    fi
+  done
+
+  flush_releases
+  while [ "$locked" -gt 0 ]; do
+    release_lock
+    locked=$(( locked - 1 ))
   done
 }
 
@@ -585,14 +863,46 @@ reap_reason() {
   fi
 }
 
+# No pidfile can be named this: json_string_field reduces an id to letters,
+# digits, underscores and dashes, and the pidfiles reap walks are named after
+# one or two of those.
+REAP_LOCK='reap+all'
+
 cmd_reap() {
-  local pidfile session state reason
+  local pidfile session state reason locked=0 to_probe=''
   local windows_pids='' unix_pids=''
+  local -a mine=()
+
+  acquire_lock "$REAP_LOCK" 0 ||
+    { log 'reap: another reap is already running'; return 0; }
 
   for pidfile in "$SESSIONS_DIR"/*.pid; do
     [ -e "$pidfile" ] || continue
     session="$(pidfile_session "$pidfile")"
 
+    # Whoever holds the lock is mid-decision about this holder, and waiting for
+    # them buys nothing the next SessionStart cannot do. Its pid still has to
+    # reach the keep list, or the sweep below would kill a live holder for the
+    # crime of not being readable right now.
+    if ! acquire_lock "$session" 0; then
+      log "reaping $session: another wakeguard holds the lock, skipping"
+      read_pidfile "$pidfile" && keep_holder
+      continue
+    fi
+    locked=$(( locked + 1 ))
+    mine+=("$pidfile")
+
+    if read_pidfile "$pidfile" && holder_is_windows; then
+      to_probe="$to_probe $HOLDER_PID"
+    fi
+  done
+
+  # One question about every windows holder at once, before any of them is
+  # judged. holder_state answers out of this for the rest of the run.
+  prefetch_windows_states "$to_probe"
+
+  for pidfile in ${mine[@]+"${mine[@]}"}; do
+    session="$(pidfile_session "$pidfile")"
     if ! read_pidfile "$pidfile"; then
       log "reaping $session: no holder pid recorded"
       rm -f "$pidfile" 2>/dev/null || true
@@ -602,18 +912,41 @@ cmd_reap() {
     state="$(holder_state)"
     reason="$(reap_reason "$state")"
     if [ -n "$reason" ]; then
+      if holder_is_windows; then
+        pend_release "$pidfile" "reaping $session ($reason)"
+        continue
+      fi
       release_pidfile "$pidfile" "reaping $session ($reason)" && continue
     fi
 
-    if holder_is_windows; then
-      windows_pids="$windows_pids $HOLDER_PID"
-    else
-      unix_pids="$unix_pids $HOLDER_PID"
-    fi
+    keep_holder
   done
 
-  sweep_unrecorded_windows "$windows_pids"
-  sweep_unrecorded_systemd "$unix_pids"
+  flush_releases
+  windows_pids="$windows_pids $UNRESOLVED_PIDS"
+  while [ "$locked" -gt 0 ]; do
+    release_lock
+    locked=$(( locked - 1 ))
+  done
+
+  # The sweeps recognize a holder by the one thing wakeguard gave it, and an
+  # arbitrary command was given nothing. Every systemd-inhibit and every
+  # PowerShell holder on the machine then belongs to somebody else.
+  if [ -z "$WAKEGUARD_CMD" ]; then
+    sweep_unrecorded_windows "$windows_pids"
+    sweep_unrecorded_systemd "$unix_pids"
+  fi
+  sweep_abandoned_locks
+}
+
+# Appends the holder read_pidfile has loaded to cmd_reap's windows_pids or
+# unix_pids, the lists it hands the sweeps.
+keep_holder() {
+  if holder_is_windows; then
+    windows_pids="$windows_pids $HOLDER_PID"
+  else
+    unix_pids="$unix_pids $HOLDER_PID"
+  fi
 }
 
 # A holder started by a hook that was killed before it could write its pidfile
@@ -640,11 +973,9 @@ Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }
 POWERSHELL
   )"
-  # The replacement is quoted so bash 5.2 does not read a & in the path as
-  # "insert the match here".
-  script="${script//__WG_SCRIPT__/"'$ps1_win'"}"
-  script="${script//__WG_KEEP__/"$(pid_list_to_csv "$recorded")"}"
-  script="${script//__WG_MIN_AGE__/$SWEEP_MIN_AGE_SECONDS}"
+  script="$(fill_in "$script" __WG_SCRIPT__ "'$ps1_win'")"
+  script="$(fill_in "$script" __WG_KEEP__ "$(pid_list_to_csv "$recorded")")"
+  script="$(fill_in "$script" __WG_MIN_AGE__ "$SWEEP_MIN_AGE_SECONDS")"
 
   # Killed in the same trip that finds them.
   for pid in $(powershell_eval "$script" | grep -E '^[0-9]+$'); do
@@ -668,24 +999,43 @@ sweep_unrecorded_systemd() {
   done
 }
 
+# A wakeguard run killed inside its critical section leaves its lock behind, and
+# the session it belonged to will never come back for it.
+sweep_abandoned_locks() {
+  local lock
+
+  for lock in "$LOCKS_DIR"/*.lock; do
+    [ -d "$lock" ] || continue
+    lock_is_stale "$lock" && steal_lock "$lock"
+  done
+}
+
 pid_list_to_csv() {
   printf '%s' "$1" | tr -s ' ' ',' | sed 's/^,//;s/,$//'
 }
 
 cmd_status() {
-  local pidfile found=0 state
+  local pidfile found=0 state to_probe=''
 
   printf 'env: %s\n' "$(detect_env)"
   printf 'sessions dir: %s\n' "$SESSIONS_DIR"
 
   for pidfile in "$SESSIONS_DIR"/*.pid; do
     [ -e "$pidfile" ] || continue
+    if read_pidfile "$pidfile" && holder_is_windows; then
+      to_probe="$to_probe $HOLDER_PID"
+    fi
+  done
+  prefetch_windows_states "$to_probe"
+
+  for pidfile in "$SESSIONS_DIR"/*.pid; do
+    [ -e "$pidfile" ] || continue
     found=1
     if read_pidfile "$pidfile"; then
       state="$(holder_state)"
-      printf '%s: %s pid=%s kind=%s env=%s claude=%s started_at=%s\n' \
+      printf '%s: %s pid=%s kind=%s env=%s claude=%s started_at=%s prompt=%s\n' \
         "$(pidfile_session "$pidfile")" "$state" "$HOLDER_PID" "$HOLDER_KIND" \
-        "$HOLDER_ENV" "${CLAUDE_PID:--}" "$STARTED_AT"
+        "$HOLDER_ENV" "${CLAUDE_PID:--}" "$STARTED_AT" "${PROMPT_ID:--}"
     else
       printf '%s: no holder pid recorded\n' "$(pidfile_session "$pidfile")"
     fi
@@ -707,8 +1057,13 @@ main() {
   case "$subcommand" in
     start|stop|end|agent-start|agent-stop)
       # A failed suppression must never break the user's turn.
-      trap 'exit 0' EXIT
+      trap 'release_locks; exit 0' EXIT
       load_config
+
+      if [ "$subcommand" = end ] && [ -n "${WAKEGUARD_END_SESSION:-}" ]; then
+        cmd_end "$WAKEGUARD_END_SESSION"
+        return 0
+      fi
       input="$(drain_stdin)"
 
       session_id="$(json_string_field "$input" session_id)"
@@ -728,15 +1083,22 @@ main() {
             log "no agent id in the hook input, doing nothing"
             return 0
           fi
-          "cmd_${subcommand#agent-}" "$session_id.$agent_id"
+          # No prompt id: a subagent holder outlives the turn that spawned it,
+          # so its stop arrives carrying a turn this holder never belonged to.
+          # SubagentStart blocks instead, which is what stops an agent-stop from
+          # arriving while the start it belongs to is still running.
+          "cmd_${subcommand#agent-}" "$session_id.$agent_id" ''
+          ;;
+        end)
+          detach_end "$session_id"
           ;;
         *)
-          "cmd_$subcommand" "$session_id"
+          "cmd_$subcommand" "$session_id" "$(json_string_field "$input" prompt_id)"
           ;;
       esac
       ;;
     reap)
-      trap 'exit 0' EXIT
+      trap 'release_locks; exit 0' EXIT
       load_config
       drain_stdin >/dev/null
       cmd_reap

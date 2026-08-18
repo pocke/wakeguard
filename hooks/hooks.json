@@ -6,7 +6,8 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/wakeguard.sh\" start",
-            "timeout": 30
+            "async": true,
+            "timeout": 60
           }
         ]
       }
@@ -28,6 +29,7 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/wakeguard.sh\" agent-stop",
+            "async": true,
             "timeout": 60
           }
         ]
@@ -39,6 +41,7 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/wakeguard.sh\" stop",
+            "async": true,
             "timeout": 60
           }
         ]
@@ -50,6 +53,7 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/wakeguard.sh\" stop",
+            "async": true,
             "timeout": 60
           }
         ]
@@ -60,8 +64,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/wakeguard.sh\" end",
-            "timeout": 60
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/wakeguard.sh\" end"
           }
         ]
       }
@@ -72,6 +75,7 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/wakeguard.sh\" reap",
+            "async": true,
             "timeout": 60
           }
         ]
