@@ -431,6 +431,21 @@ test_the_session_ending_does_not_wait() {
   assert_dead "$pid" 'a session that is over is not waiting for anything'
 }
 
+test_the_wait_is_a_minute_by_default() {
+  local pid waiter
+  # Every other test asks for no wait, so this is the only one that reaches the
+  # value wakeguard ships with.
+  unset WAKEGUARD_GRACE_SECONDS
+  wg start "$(turn s1 p1)"
+  pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
+
+  bash "$WG" stop <<<"$(turn s1 p1)" >/dev/null 2>&1 &
+  waiter=$!
+  sleep 2
+  assert_alive "$pid" 'a wakeguard nobody configured should still wait'
+  stop_waiting "$waiter"
+}
+
 test_a_wait_of_zero_releases_at_once() {
   local pid started elapsed
   wg start "$(turn s1 p1)"

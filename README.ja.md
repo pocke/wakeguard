@@ -74,7 +74,7 @@ pidfile は `${XDG_STATE_HOME:-~/.local/state}/wakeguard/sessions/` に置く。
 | `WAKEGUARD_CMD` | 環境判定で選ばれるホルダーの代わりに、このコマンドをホルダーとして起動する (例: `caffeinate -dims`)。空白で区切るので、引数をクォートでまとめることはできない | 未設定 |
 | `WAKEGUARD_DISPLAY` | `1` にするとディスプレイも点けたままにする (`caffeinate -d` / `-KeepDisplayOn`)。Linux では効かない | `0` |
 | `WAKEGUARD_MAX_HOURS` | ホルダーが自分から終了するまでの上限時間。[0.001, 168] の数値で、それ以外を書くと既定値に戻る | `8` |
-| `WAKEGUARD_GRACE_SECONDS` | ホルダーを解放するまで待つ秒数。待っていた作業に起こされたセッションが動き出すまで、マシンを起こしたままにしておくため。`0` にすると即座に解放する。240 秒を超える値は既定値に戻す。待ちを、それに耐えるフック自身の timeout の内側に収めるため | `60` |
+| `WAKEGUARD_GRACE_SECONDS` | ホルダーを解放するまで待つ秒数。待っていた作業に起こされたセッションが動き出すまで、マシンを起こしたままにしておくため。[0, 240] の整数秒で、それ以外を書くと既定値に戻る。上限があるのは、待っている間フックが生きていられるよう、フック自身の timeout の内側に収めるため | `60` |
 | `WAKEGUARD_LOG` | 診断メッセージをこのファイルに追記する。設定しない限りログはどこにも出ず、バックグラウンドで走るフックの出力は端末にも流れないので、wakeguard が何をしたか見る手段はこれだけ | 未設定 |
 
 ## 効いているか確かめる
@@ -122,7 +122,7 @@ kill する前に、記録した PID が本当に自分が起動したホルダ�
 bash test/wakeguard_test.sh
 ```
 
-テストは `WAKEGUARD_CMD` にただの `sleep` を指定して走るので、PowerShell も `caffeinate` も `systemd-inhibit` も使わずに pidfile・ロック・reap を動かせる。どの環境でも同じように通り、25 秒ほどで終わる。
+テストは `WAKEGUARD_CMD` にただの `sleep` を指定して走るので、PowerShell も `caffeinate` も `systemd-inhibit` も使わずに pidfile・ロック・reap を動かせる。どの環境でも同じように通り、20 秒ほどで終わる。
 
 ## Linux について
 

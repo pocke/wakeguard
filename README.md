@@ -133,7 +133,7 @@ the file.
 | `WAKEGUARD_CMD` | Run this command as the holder instead of the one picked by environment detection, e.g. `caffeinate -dims`. Split on whitespace, so quoting an argument does not work | unset |
 | `WAKEGUARD_DISPLAY` | `1` keeps the display on as well (`caffeinate -d` / `-KeepDisplayOn`). No effect on Linux | `0` |
 | `WAKEGUARD_MAX_HOURS` | How long a holder may live before it gives up on its own. A number in [0.001, 168]; anything else falls back to the default | `8` |
-| `WAKEGUARD_GRACE_SECONDS` | How long a release waits, so that a session woken by work it was waiting on finds the machine awake until it is going again. `0` releases at once. Anything above 240 falls back to the default, to keep the wait inside the timeout of the hook that has to survive it | `60` |
+| `WAKEGUARD_GRACE_SECONDS` | How long a release waits, so that a session woken by work it was waiting on finds the machine awake until it is going again. A whole number of seconds in [0, 240]; anything else falls back to the default. The upper end keeps the wait inside the timeout of the hook that has to last through it | `60` |
 | `WAKEGUARD_LOG` | Append diagnostics to this file. Nothing is written anywhere without it, and a background hook's output never reaches the terminal, so this is the only way to watch what wakeguard did | unset |
 
 ## Checking that it works
@@ -203,7 +203,7 @@ bash test/wakeguard_test.sh
 
 The tests set `WAKEGUARD_CMD` to a plain `sleep`, so they exercise the pidfiles,
 the locks and the reap without PowerShell, `caffeinate` or `systemd-inhibit`,
-and they run the same on every platform. They take about twenty-five seconds.
+and they run the same on every platform. They take about twenty seconds.
 
 ## Linux
 
