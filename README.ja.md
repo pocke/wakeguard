@@ -122,7 +122,7 @@ kill する前に、記録した PID が本当に自分が起動したホルダ�
 bash test/wakeguard_test.sh
 ```
 
-テストは `WAKEGUARD_CMD` にただの `sleep` を指定して走るので、PowerShell も `caffeinate` も `systemd-inhibit` も使わずに pidfile・ロック・reap を動かせる。どの環境でも同じように通り、20 秒ほどで終わる。
+テストは `WAKEGUARD_CMD` にただの `sleep` を指定して走るので、PowerShell も `caffeinate` も `systemd-inhibit` も使わずに pidfile・ロック・reap を動かせる。どの環境でも同じように通り、25 秒ほどで終わる。
 
 ## Linux について
 
