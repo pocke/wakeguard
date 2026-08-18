@@ -203,7 +203,7 @@ bash test/wakeguard_test.sh
 
 The tests set `WAKEGUARD_CMD` to a plain `sleep`, so they exercise the pidfiles,
 the locks and the reap without PowerShell, `caffeinate` or `systemd-inhibit`,
-and they run the same on every platform. They take about fifteen seconds.
+and they run the same on every platform. They take about twenty-five seconds.
 
 ## Linux
 

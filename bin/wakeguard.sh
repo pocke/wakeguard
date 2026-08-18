@@ -251,7 +251,7 @@ write_pidfile() {
       # A holder handed to a second subagent under the same id is recorded with
       # everything else unchanged, and a release that waited has only the file
       # to tell it that happened.
-      printf 'WRITTEN_BY=%s\n' "$$"
+      printf 'WRITTEN_BY=%s\n' "$$-$RANDOM"
     } >"$tmp" &&
       mv -f "$tmp" "$file"
   } 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }

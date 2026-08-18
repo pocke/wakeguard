@@ -109,6 +109,15 @@ powershell_calls() {
   grep -c '^END-OF-SCRIPT$' "$WORK/powershell.log" 2>/dev/null || printf 0
 }
 
+# Ends a run that is in the middle of its wait. Cutting the sleep short lets the
+# run finish on its own; where there is no pkill to cut it with — Git Bash ships
+# none — the run goes instead and the sleep is left over, which is why the runs
+# that wait are started without a hold on this suite's output.
+stop_waiting() {
+  pkill -P "$1" 2>/dev/null || kill "$1" 2>/dev/null
+  wait "$1" 2>/dev/null
+}
+
 # A pid that is certain to be gone.
 dead_pid() {
   local pid
@@ -440,15 +449,12 @@ test_a_wait_that_is_not_a_number_falls_back() {
   wg start "$(turn s1 p1)"
   pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
 
-  WAKEGUARD_GRACE_SECONDS=soon bash "$WG" stop <<<"$(turn s1 p1)" 2>/dev/null &
+  WAKEGUARD_GRACE_SECONDS=soon bash "$WG" stop <<<"$(turn s1 p1)" >/dev/null 2>&1 &
   waiter=$!
   sleep 2
   assert_alive "$pid" 'an unusable wait should fall back to the default, not to none'
   assert_log 'using 60' 'and say what it fell back to'
-  # Cutting the sleep short lets the run finish on its own; killing the run
-  # instead would leave the sleep behind as an orphan.
-  pkill -P "$waiter" 2>/dev/null
-  wait "$waiter" 2>/dev/null
+  stop_waiting "$waiter"
 }
 
 test_a_wait_longer_than_its_hook_falls_back() {
@@ -456,13 +462,12 @@ test_a_wait_longer_than_its_hook_falls_back() {
   wg start "$(turn s1 p1)"
   pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
 
-  WAKEGUARD_GRACE_SECONDS=100000 bash "$WG" stop <<<"$(turn s1 p1)" 2>/dev/null &
+  WAKEGUARD_GRACE_SECONDS=100000 bash "$WG" stop <<<"$(turn s1 p1)" >/dev/null 2>&1 &
   waiter=$!
   sleep 2
   assert_alive "$pid" 'the fallback should still be a wait'
   assert_log 'using 60' 'of sixty seconds, not of the value asked for'
-  pkill -P "$waiter" 2>/dev/null
-  wait "$waiter" 2>/dev/null
+  stop_waiting "$waiter"
 }
 
 test_the_wait_can_be_set_in_the_config_file() {
@@ -498,8 +503,8 @@ test_a_holder_taken_over_during_the_wait_is_left_alone() {
   wg agent-start '{"session_id":"s1","agent_id":"a1"}'
   wait
 
-  assert_alive "$(field "$SESSIONS/s1.a1.pid" HOLDER_PID)" 'the holder recorded now should still be running'
-  assert_file "$SESSIONS/s1.a1.pid" 'and still be recorded'
+  assert_alive "$agent_pid" 'the holder should have been left where it was found'
+  assert_eq "$(field "$SESSIONS/s1.a1.pid" HOLDER_PID)" "$agent_pid" 'and still be the one recorded'
 }
 
 # --- holders on the Windows host ----------------------------------------------
