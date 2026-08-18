@@ -82,6 +82,19 @@ pair them. Blocking is what keeps a subagent that fails immediately from having
 its `SubagentStop` overtake the `SubagentStart` still recording the holder,
 which would leave that holder with nothing to release it.
 
+A release waits a minute before it happens. A turn ending is not always a
+session finishing: ask for a subagent and the turn ends while it runs, and
+Claude Code comes back to the session when it is done. The subagent's own
+holder covers the run, but it goes with its `SubagentStop`, which lands before
+the session is woken — and the machine can fall asleep in that handover and
+never take the wake-up. Waiting to release covers it without wakeguard having
+to know what the session was waiting on, which is the only way to cover the
+wake-ups it cannot see coming: an API error ends a turn through `StopFailure`,
+which is told nothing about work in flight, and a `/loop` or a `ScheduleWakeup`
+fires from a schedule wakeguard does not read. A turn that starts inside the
+wait takes the holder over, and the `prompt_id` above is what keeps the waiting
+release from killing it on its way out.
+
 The holder per environment:
 
 | Environment | Holder |
@@ -116,6 +129,7 @@ the file.
 | `WAKEGUARD_CMD` | Run this command as the holder instead of the one picked by environment detection, e.g. `caffeinate -dims`. Split on whitespace, so quoting an argument does not work | unset |
 | `WAKEGUARD_DISPLAY` | `1` keeps the display on as well (`caffeinate -d` / `-KeepDisplayOn`). No effect on Linux | `0` |
 | `WAKEGUARD_MAX_HOURS` | How long a holder may live before it gives up on its own. A number in [0.001, 168]; anything else falls back to the default | `8` |
+| `WAKEGUARD_GRACE_SECONDS` | How long a release waits, so that a session woken by work it was waiting on still finds the machine awake. `0` releases at once. Keep it under the hook's own timeout — five minutes, in the hooks this plugin ships — or the release is killed before it happens and left to `SessionEnd` | `60` |
 | `WAKEGUARD_LOG` | Append diagnostics to this file. Nothing is written anywhere without it, and a background hook's output never reaches the terminal, so this is the only way to watch what wakeguard did | unset |
 
 ## Checking that it works
@@ -142,7 +156,7 @@ Every way a session can end has something that releases the suppression:
 
 | How it ends | What releases it |
 |---|---|
-| Turn finishes, normally or on an API error | `Stop` / `StopFailure` hook |
+| Turn finishes, normally or on an API error | `Stop` / `StopFailure` hook, a `WAKEGUARD_GRACE_SECONDS` wait later |
 | Session ends with exit or Ctrl-C | `SessionEnd` hook, which clears every holder the session has, subagent holders included. A pidfile another wakeguard has locked at that moment is left to the reap |
 | A subagent finishes | `SubagentStop` hook |
 | Claude Code is killed or crashes | macOS: `caffeinate -w` exits with it. Everywhere: the next `SessionStart` reap notices the dead pid |
@@ -160,7 +174,8 @@ Half of the table leans on the reap, and the reap only runs when a session
 starts. Start no session, and a holder nobody released stays until its own
 `WAKEGUARD_MAX_HOURS` deadline.
 
-**Three gaps worth knowing about.** Interrupting a turn with Esc is not a `Stop`
+**Three gaps worth knowing about.** They all outlast the wait above, which is
+why they are gaps rather than moments. Interrupting a turn with Esc is not a `Stop`
 event, so the holder stays until the next turn ends or the session does. Until
 then the machine will not sleep on its own. Whether `SubagentStop` arrives when
 a subagent is interrupted along with the turn is unverified; if it does not, its
@@ -192,8 +207,12 @@ without consulting it, so the fallback does not hold there.
 
 ## Out of scope
 
-**`Bash` run in the background.** No event reliably marks one as finished, so
-covering it would add a way to leave the suppression on forever.
+**`Bash` run in the background.** `Stop` does name what is in flight, so
+wakeguard could hold the machine awake until a background shell exits — and a
+shell that never exits would hold it awake until the holder's own deadline,
+which is the way to leave the suppression on forever this plugin exists to
+avoid. A background shell that finishes inside the wait above is covered like
+anything else; one that runs longer is not.
 
 **`TaskCreated` / `TaskCompleted`.** These fire when an item is written to the
 task list or marked done, which says nothing about anything starting or

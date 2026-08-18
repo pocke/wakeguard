@@ -37,6 +37,7 @@ load_config() {
       line="${line%$'\r'}"
       case "$line" in
         WAKEGUARD_CMD=*|WAKEGUARD_DISPLAY=*|WAKEGUARD_MAX_HOURS=*|WAKEGUARD_LOG=*) ;;
+        WAKEGUARD_GRACE_SECONDS=*) ;;
         *) continue ;;
       esac
       key="${line%%=*}"
@@ -53,8 +54,10 @@ load_config() {
   WAKEGUARD_DISPLAY="${WAKEGUARD_DISPLAY:-0}"
   WAKEGUARD_MAX_HOURS="${WAKEGUARD_MAX_HOURS:-8}"
   WAKEGUARD_LOG="${WAKEGUARD_LOG:-}"
+  WAKEGUARD_GRACE_SECONDS="${WAKEGUARD_GRACE_SECONDS:-60}"
 
   normalize_max_hours
+  normalize_grace_seconds
 }
 
 # An out-of-range or malformed value does not fail loudly: it makes the holder
@@ -75,6 +78,17 @@ normalize_max_hours() {
     value=8
   fi
   WAKEGUARD_MAX_HOURS="$value"
+}
+
+# A value that is not a number would make the wait either never end or never
+# happen, and both are worse than the default.
+normalize_grace_seconds() {
+  case "$WAKEGUARD_GRACE_SECONDS" in
+    ''|*[!0-9]*)
+      log "WAKEGUARD_GRACE_SECONDS=$WAKEGUARD_GRACE_SECONDS is not a whole number of seconds, using 60"
+      WAKEGUARD_GRACE_SECONDS=60
+      ;;
+  esac
 }
 
 max_hours_seconds() {
@@ -753,10 +767,25 @@ flush_releases() {
   PENDING_LABELS=()
 }
 
+# Nothing marks the moment Claude Code comes back to a session that was waiting
+# on something, and by then the holder that covered the wait is gone: a
+# subagent's own holder goes with its SubagentStop, which lands before the
+# session is woken. Waiting to release covers the handover, whatever the session
+# was waiting on and whatever wakes it.
+#
+# A turn that starts inside the wait takes the holder over, and the prompt id is
+# what stops this run from killing it on the way out. The hook is async, so the
+# wait costs the turn nothing.
+grace_wait() {
+  [ "$WAKEGUARD_GRACE_SECONDS" != 0 ] || return 0
+  sleep "$WAKEGUARD_GRACE_SECONDS"
+}
+
 cmd_stop() {
   local key="$1" prompt_id="$2" pidfile
   pidfile="$(pidfile_path "$key")"
 
+  grace_wait
   acquire_lock "$key" "$LOCK_WAIT_SECONDS" ||
     { log "stop $key: the lock stayed taken, leaving the holder to end and reap"; return 0; }
 

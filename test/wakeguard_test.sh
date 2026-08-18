@@ -17,6 +17,7 @@ setup() {
   export WAKEGUARD_MAX_HOURS=8
   export WAKEGUARD_LOG="$WORK/log"
   export WAKEGUARD_LOCK_WAIT_SECONDS=2
+  export WAKEGUARD_GRACE_SECONDS=0
   SESSIONS="$XDG_STATE_HOME/wakeguard/sessions"
   LOCKS="$XDG_STATE_HOME/wakeguard/locks"
   STRAYS=()
@@ -357,6 +358,96 @@ test_reap_judges_every_pidfile_of_a_walk_on_its_own() {
   assert_no_file "$SESSIONS/s1.pid" 'the released pidfile should be gone'
   assert_file "$SESSIONS/s2.pid" 'the healthy pidfile should stay'
   assert_file "$SESSIONS/s3.pid" 'the skipped pidfile should stay'
+}
+
+# --- the moment after a turn -------------------------------------------------
+#
+# Nothing marks the point where a session is woken by work it was waiting on,
+# and the holder that covered the wait is gone by then. A release that waits
+# covers the handover.
+
+test_stop_waits_before_it_releases() {
+  local pid started elapsed
+  wg start "$(turn s1 p1)"
+  pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
+
+  started="$(date '+%s')"
+  WAKEGUARD_GRACE_SECONDS=3 bash "$WG" stop <<<"$(turn s1 p1)"
+  elapsed=$(( $(date '+%s') - started ))
+
+  assert_dead "$pid" 'the holder should go once the wait is over'
+  [ "$elapsed" -ge 3 ] || fail "the release should have waited: took ${elapsed}s"
+}
+
+test_a_turn_starting_inside_the_wait_keeps_the_holder() {
+  local pid
+  wg start "$(turn s1 p1)"
+  pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
+
+  WAKEGUARD_GRACE_SECONDS=3 bash "$WG" stop <<<"$(turn s1 p1)" &
+  sleep 1
+  wg start "$(turn s1 p2)"
+  wait
+
+  assert_alive "$pid" 'the turn that woke inside the wait should keep the holder'
+  assert_file "$SESSIONS/s1.pid" 'and its pidfile'
+  assert_eq "$(field "$SESSIONS/s1.pid" PROMPT_ID)" p2 'which now belongs to that turn'
+}
+
+test_a_subagent_holder_waits_too() {
+  local agent_pid started elapsed
+  wg start "$(turn s1 p1)"
+  wg agent-start '{"session_id":"s1","agent_id":"a1"}'
+  agent_pid="$(field "$SESSIONS/s1.a1.pid" HOLDER_PID)"
+
+  # This is the release the reported gap opens on: the session is woken after
+  # it, not before.
+  started="$(date '+%s')"
+  WAKEGUARD_GRACE_SECONDS=3 bash "$WG" agent-stop <<<'{"session_id":"s1","agent_id":"a1"}'
+  elapsed=$(( $(date '+%s') - started ))
+
+  assert_dead "$agent_pid" 'the subagent holder should go once the wait is over'
+  [ "$elapsed" -ge 3 ] || fail "the release should have waited: took ${elapsed}s"
+}
+
+test_the_session_ending_does_not_wait() {
+  local pid started elapsed
+  wg start "$(turn s1 p1)"
+  pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
+
+  started="$(date '+%s')"
+  WAKEGUARD_GRACE_SECONDS=30 wg end '{"session_id":"s1"}'
+  wait_gone "$SESSIONS/s1.pid"
+  elapsed=$(( $(date '+%s') - started ))
+
+  assert_dead "$pid" 'a session that is over is not waiting for anything'
+  [ "$elapsed" -lt 30 ] || fail "end should not wait: took ${elapsed}s"
+}
+
+test_a_wait_of_zero_releases_at_once() {
+  local pid started elapsed
+  wg start "$(turn s1 p1)"
+  pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
+
+  started="$(date '+%s')"
+  WAKEGUARD_GRACE_SECONDS=0 bash "$WG" stop <<<"$(turn s1 p1)"
+  elapsed=$(( $(date '+%s') - started ))
+
+  assert_dead "$pid" 'the holder should go'
+  [ "$elapsed" -lt 3 ] || fail "nothing should have been waited for: took ${elapsed}s"
+}
+
+test_a_wait_that_is_not_a_number_falls_back() {
+  local pid
+  wg start "$(turn s1 p1)"
+  pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
+
+  WAKEGUARD_GRACE_SECONDS=soon bash "$WG" stop <<<"$(turn s1 p1)" &
+  sleep 2
+  assert_alive "$pid" 'an unusable wait should fall back to the default, not to none'
+  kill %1 2>/dev/null
+  wait 2>/dev/null
+  assert_log 'is not a whole number of seconds' 'and say so'
 }
 
 # --- holders on the Windows host ----------------------------------------------
