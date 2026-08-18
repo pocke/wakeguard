@@ -17,6 +17,7 @@ setup() {
   export WAKEGUARD_MAX_HOURS=8
   export WAKEGUARD_LOG="$WORK/log"
   export WAKEGUARD_LOCK_WAIT_SECONDS=2
+  export WAKEGUARD_GRACE_SECONDS=0
   SESSIONS="$XDG_STATE_HOME/wakeguard/sessions"
   LOCKS="$XDG_STATE_HOME/wakeguard/locks"
   STRAYS=()
@@ -106,6 +107,15 @@ EOF
 
 powershell_calls() {
   grep -c '^END-OF-SCRIPT$' "$WORK/powershell.log" 2>/dev/null || printf 0
+}
+
+# Ends a run that is in the middle of its wait. Cutting the sleep short lets the
+# run finish on its own; where there is no pkill to cut it with — Git Bash ships
+# none — the run goes instead and the sleep is left over, which is why the runs
+# that wait are started without a hold on this suite's output.
+stop_waiting() {
+  pkill -P "$1" 2>/dev/null || kill "$1" 2>/dev/null
+  wait "$1" 2>/dev/null
 }
 
 # A pid that is certain to be gone.
@@ -357,6 +367,159 @@ test_reap_judges_every_pidfile_of_a_walk_on_its_own() {
   assert_no_file "$SESSIONS/s1.pid" 'the released pidfile should be gone'
   assert_file "$SESSIONS/s2.pid" 'the healthy pidfile should stay'
   assert_file "$SESSIONS/s3.pid" 'the skipped pidfile should stay'
+}
+
+# --- the moment after a turn -------------------------------------------------
+#
+# Nothing marks the point where a session is woken by work it was waiting on,
+# and the holder that covered the wait is gone by then. A release that waits
+# covers the handover.
+
+test_stop_waits_before_it_releases() {
+  local pid started elapsed
+  wg start "$(turn s1 p1)"
+  pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
+
+  started="$(date '+%s')"
+  WAKEGUARD_GRACE_SECONDS=3 bash "$WG" stop <<<"$(turn s1 p1)"
+  elapsed=$(( $(date '+%s') - started ))
+
+  assert_dead "$pid" 'the holder should go once the wait is over'
+  [ "$elapsed" -ge 3 ] || fail "the release should have waited: took ${elapsed}s"
+}
+
+test_a_turn_starting_inside_the_wait_keeps_the_holder() {
+  local pid
+  wg start "$(turn s1 p1)"
+  pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
+
+  WAKEGUARD_GRACE_SECONDS=3 bash "$WG" stop <<<"$(turn s1 p1)" &
+  sleep 1
+  wg start "$(turn s1 p2)"
+  wait
+
+  assert_alive "$pid" 'the turn that woke inside the wait should keep the holder'
+  assert_file "$SESSIONS/s1.pid" 'and its pidfile'
+  assert_eq "$(field "$SESSIONS/s1.pid" PROMPT_ID)" p2 'which now belongs to that turn'
+}
+
+test_a_subagent_holder_waits_too() {
+  local agent_pid started elapsed
+  wg start "$(turn s1 p1)"
+  wg agent-start '{"session_id":"s1","agent_id":"a1"}'
+  agent_pid="$(field "$SESSIONS/s1.a1.pid" HOLDER_PID)"
+
+  # The gap opens on this release: the session is woken after it, not before.
+  started="$(date '+%s')"
+  WAKEGUARD_GRACE_SECONDS=3 bash "$WG" agent-stop <<<'{"session_id":"s1","agent_id":"a1"}'
+  elapsed=$(( $(date '+%s') - started ))
+
+  assert_dead "$agent_pid" 'the subagent holder should go once the wait is over'
+  [ "$elapsed" -ge 3 ] || fail "the release should have waited: took ${elapsed}s"
+}
+
+test_the_session_ending_does_not_wait() {
+  local pid
+  wg start "$(turn s1 p1)"
+  pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
+
+  # wait_gone gives up after ten seconds, so a release that waited thirty would
+  # leave the holder running here.
+  WAKEGUARD_GRACE_SECONDS=30 wg end '{"session_id":"s1"}'
+  wait_gone "$SESSIONS/s1.pid"
+
+  assert_dead "$pid" 'a session that is over is not waiting for anything'
+}
+
+test_the_wait_is_a_minute_by_default() {
+  local pid waiter
+  # Every other test asks for no wait, so this is the only one that reaches the
+  # value wakeguard ships with.
+  unset WAKEGUARD_GRACE_SECONDS
+  wg start "$(turn s1 p1)"
+  pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
+
+  bash "$WG" stop <<<"$(turn s1 p1)" >/dev/null 2>&1 &
+  waiter=$!
+  sleep 2
+  assert_alive "$pid" 'a wakeguard nobody configured should still wait'
+  stop_waiting "$waiter"
+}
+
+test_a_wait_of_zero_releases_at_once() {
+  local pid started elapsed
+  wg start "$(turn s1 p1)"
+  pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
+
+  started="$(date '+%s')"
+  WAKEGUARD_GRACE_SECONDS=0 bash "$WG" stop <<<"$(turn s1 p1)"
+  elapsed=$(( $(date '+%s') - started ))
+
+  assert_dead "$pid" 'the holder should go'
+  [ "$elapsed" -lt 3 ] || fail "nothing should have been waited for: took ${elapsed}s"
+}
+
+test_a_wait_that_is_not_a_number_falls_back() {
+  local pid waiter
+  wg start "$(turn s1 p1)"
+  pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
+
+  WAKEGUARD_GRACE_SECONDS=soon bash "$WG" stop <<<"$(turn s1 p1)" >/dev/null 2>&1 &
+  waiter=$!
+  sleep 2
+  assert_alive "$pid" 'an unusable wait should fall back to the default, not to none'
+  assert_log 'using 60' 'and say what it fell back to'
+  stop_waiting "$waiter"
+}
+
+test_a_wait_longer_than_its_hook_falls_back() {
+  local pid waiter
+  wg start "$(turn s1 p1)"
+  pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
+
+  WAKEGUARD_GRACE_SECONDS=100000 bash "$WG" stop <<<"$(turn s1 p1)" >/dev/null 2>&1 &
+  waiter=$!
+  sleep 2
+  assert_alive "$pid" 'the fallback should still be a wait'
+  assert_log 'using 60' 'of sixty seconds, not of the value asked for'
+  stop_waiting "$waiter"
+}
+
+test_the_wait_can_be_set_in_the_config_file() {
+  local pid
+  mkdir -p "$XDG_CONFIG_HOME/wakeguard"
+  printf 'WAKEGUARD_GRACE_SECONDS=0\n' >"$XDG_CONFIG_HOME/wakeguard/config"
+  wg start "$(turn s1 p1)"
+  pid="$(field "$SESSIONS/s1.pid" HOLDER_PID)"
+
+  local started elapsed
+  unset WAKEGUARD_GRACE_SECONDS
+  started="$(date '+%s')"
+  wg stop "$(turn s1 p1)"
+  elapsed=$(( $(date '+%s') - started ))
+  export WAKEGUARD_GRACE_SECONDS=0
+
+  assert_dead "$pid" 'the config file should be read for the wait as for everything else'
+  [ "$elapsed" -lt 3 ] || fail "the file said not to wait, and it waited ${elapsed}s"
+}
+
+test_a_holder_taken_over_during_the_wait_is_left_alone() {
+  local agent_pid
+  wg start "$(turn s1 p1)"
+  wg agent-start '{"session_id":"s1","agent_id":"a1"}'
+  agent_pid="$(field "$SESSIONS/s1.a1.pid" HOLDER_PID)"
+
+  # A subagent's stop carries no turn to pair with, so the pidfile itself is
+  # what says whether anything happened while this run waited.
+  WAKEGUARD_GRACE_SECONDS=3 bash "$WG" agent-stop <<<'{"session_id":"s1","agent_id":"a1"}' &
+  sleep 1
+  # The same id again: the record it leaves says the same things as the one this
+  # release read, apart from who wrote it.
+  wg agent-start '{"session_id":"s1","agent_id":"a1"}'
+  wait
+
+  assert_alive "$agent_pid" 'the holder should have been left where it was found'
+  assert_eq "$(field "$SESSIONS/s1.a1.pid" HOLDER_PID)" "$agent_pid" 'and still be the one recorded'
 }
 
 # --- holders on the Windows host ----------------------------------------------

@@ -82,6 +82,23 @@ pair them. Blocking is what keeps a subagent that fails immediately from having
 its `SubagentStop` overtake the `SubagentStart` still recording the holder,
 which would leave that holder with nothing to release it.
 
+A turn's holder and a subagent's are released a minute after their hook says
+so. A turn ending is not always a session finishing: ask for a subagent and the
+turn ends while it runs, and Claude Code comes back to the session when it is
+done. The subagent's own holder covers the run, but it goes with its
+`SubagentStop`, which lands before the session is woken — and the machine can
+fall asleep in that handover and never take the wake-up. Waiting covers it
+without wakeguard having to know what the session was waiting on, which is what
+lets it cover the wake-ups it cannot see coming at all: an API error ends a
+turn through `StopFailure`, which is told nothing about work in flight, and a
+`/loop` or a `ScheduleWakeup` fires from a schedule wakeguard does not read —
+either is covered if it lands inside the wait, and neither is if it lands
+after. Whatever takes the holder over inside the wait — the turn Claude Code
+opens on the wake-up, or a second subagent — leaves the pidfile rewritten, and
+a release that finds it rewritten leaves the holder alone. That is what makes a
+late release safe where `prompt_id` cannot reach: a subagent's stop names no
+turn at all.
+
 The holder per environment:
 
 | Environment | Holder |
@@ -116,6 +133,7 @@ the file.
 | `WAKEGUARD_CMD` | Run this command as the holder instead of the one picked by environment detection, e.g. `caffeinate -dims`. Split on whitespace, so quoting an argument does not work | unset |
 | `WAKEGUARD_DISPLAY` | `1` keeps the display on as well (`caffeinate -d` / `-KeepDisplayOn`). No effect on Linux | `0` |
 | `WAKEGUARD_MAX_HOURS` | How long a holder may live before it gives up on its own. A number in [0.001, 168]; anything else falls back to the default | `8` |
+| `WAKEGUARD_GRACE_SECONDS` | How long a release waits, so that a session woken by work it was waiting on finds the machine awake until it is going again. A whole number of seconds in [0, 240]; anything else falls back to the default. The upper end keeps the wait inside the timeout of the hook that has to last through it | `60` |
 | `WAKEGUARD_LOG` | Append diagnostics to this file. Nothing is written anywhere without it, and a background hook's output never reaches the terminal, so this is the only way to watch what wakeguard did | unset |
 
 ## Checking that it works
@@ -136,15 +154,18 @@ a turn is in progress:
 - Windows: `powercfg /requests` in an elevated prompt, look for `powershell`
   under `SYSTEM`. From WSL2, check this on the Windows host, not inside WSL
 
+The suppression outlives the turn by `WAKEGUARD_GRACE_SECONDS`, so a holder
+found within a minute of one ending is on its way out rather than left behind.
+
 ## Never leaving the machine awake
 
 Every way a session can end has something that releases the suppression:
 
 | How it ends | What releases it |
 |---|---|
-| Turn finishes, normally or on an API error | `Stop` / `StopFailure` hook |
+| Turn finishes, normally or on an API error | `Stop` / `StopFailure` hook, a `WAKEGUARD_GRACE_SECONDS` wait later |
 | Session ends with exit or Ctrl-C | `SessionEnd` hook, which clears every holder the session has, subagent holders included. A pidfile another wakeguard has locked at that moment is left to the reap |
-| A subagent finishes | `SubagentStop` hook |
+| A subagent finishes | `SubagentStop` hook, a `WAKEGUARD_GRACE_SECONDS` wait later — this is the release the machine used to fall asleep after |
 | Claude Code is killed or crashes | macOS: `caffeinate -w` exits with it. Everywhere: the next `SessionStart` reap notices the dead pid |
 | A hook is killed before it records the holder | The next `SessionStart` reap sweeps holders that no pidfile claims, on Windows and Linux. macOS has no sweep: `caffeinate` carries no marker telling ours from one the user started by hand, so an unrecorded one falls back to `caffeinate -w` and then to its `-t` deadline |
 | A session closes while a background hook is still working | Claude Code kills the hook — documented for `claude -p`, and the same in every run wakeguard was tested in. That leaves the case above, and the interop round trip the hook dies in is what makes the window wide enough to hit, which puts it on Windows and WSL2, where the sweep runs |
@@ -182,7 +203,7 @@ bash test/wakeguard_test.sh
 
 The tests set `WAKEGUARD_CMD` to a plain `sleep`, so they exercise the pidfiles,
 the locks and the reap without PowerShell, `caffeinate` or `systemd-inhibit`,
-and they run the same on every platform. They take about fifteen seconds.
+and they run the same on every platform. They take about twenty-five seconds.
 
 ## Linux
 
@@ -192,8 +213,12 @@ without consulting it, so the fallback does not hold there.
 
 ## Out of scope
 
-**`Bash` run in the background.** No event reliably marks one as finished, so
-covering it would add a way to leave the suppression on forever.
+**`Bash` run in the background.** `Stop` does name what is in flight, so
+wakeguard could hold the machine awake until a background shell exits — and a
+shell that never exits would hold it awake until the holder's own deadline,
+which is the way to leave the suppression on forever this plugin exists to
+avoid. A background shell that finishes inside the wait above is covered like
+anything else; one that runs longer is not.
 
 **`TaskCreated` / `TaskCompleted`.** These fire when an item is written to the
 task list or marked done, which says nothing about anything starting or

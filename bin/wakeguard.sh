@@ -36,7 +36,8 @@ load_config() {
     while IFS= read -r line || [ -n "$line" ]; do
       line="${line%$'\r'}"
       case "$line" in
-        WAKEGUARD_CMD=*|WAKEGUARD_DISPLAY=*|WAKEGUARD_MAX_HOURS=*|WAKEGUARD_LOG=*) ;;
+        WAKEGUARD_CMD=*|WAKEGUARD_DISPLAY=*|WAKEGUARD_MAX_HOURS=*|WAKEGUARD_LOG=*|\
+        WAKEGUARD_GRACE_SECONDS=*) ;;
         *) continue ;;
       esac
       key="${line%%=*}"
@@ -53,8 +54,10 @@ load_config() {
   WAKEGUARD_DISPLAY="${WAKEGUARD_DISPLAY:-0}"
   WAKEGUARD_MAX_HOURS="${WAKEGUARD_MAX_HOURS:-8}"
   WAKEGUARD_LOG="${WAKEGUARD_LOG:-}"
+  WAKEGUARD_GRACE_SECONDS="${WAKEGUARD_GRACE_SECONDS:-60}"
 
   normalize_max_hours
+  normalize_grace_seconds
 }
 
 # An out-of-range or malformed value does not fail loudly: it makes the holder
@@ -75,6 +78,23 @@ normalize_max_hours() {
     value=8
   fi
   WAKEGUARD_MAX_HOURS="$value"
+}
+
+# The hooks that wait allow themselves 300 seconds in hooks/hooks.json, and what
+# follows the wait can take a lock wait (LOCK_WAIT_SECONDS) and a round trip to
+# the Windows host. A wait that outlives its hook is a holder nobody releases.
+GRACE_MAX_SECONDS=240
+
+# `sleep inf` is the value that would wait forever; everything else that is not
+# a number makes sleep fail and the wait vanish.
+normalize_grace_seconds() {
+  case "$WAKEGUARD_GRACE_SECONDS" in
+    ''|*[!0-9]*) ;;
+    *) [ "$WAKEGUARD_GRACE_SECONDS" -le "$GRACE_MAX_SECONDS" ] 2>/dev/null && return 0 ;;
+  esac
+
+  WAKEGUARD_GRACE_SECONDS=60
+  log "WAKEGUARD_GRACE_SECONDS is not a whole number of seconds in [0, $GRACE_MAX_SECONDS], using $WAKEGUARD_GRACE_SECONDS"
 }
 
 max_hours_seconds() {
@@ -228,6 +248,10 @@ write_pidfile() {
       printf 'STARTED_AT=%s\n' "$STARTED_AT"
       printf 'BOOT_ID=%s\n' "$BOOT_ID"
       printf 'PROMPT_ID=%s\n' "$PROMPT_ID"
+      # A holder handed to a second subagent under the same id is recorded with
+      # everything else unchanged, and a release that waited has only the file
+      # to tell it that happened.
+      printf 'WRITTEN_BY=%s\n' "$$-$RANDOM"
     } >"$tmp" &&
       mv -f "$tmp" "$file"
   } 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
@@ -753,16 +777,35 @@ flush_releases() {
   PENDING_LABELS=()
 }
 
+# A subagent's holder goes with its SubagentStop, and that lands before Claude
+# Code comes back to the session the subagent was running for. Nothing marks the
+# moment it does come back, so the release waits instead.
+#
+# The wait happens before the lock: holding one for a minute would have the next
+# turn's start give up on it, and reap take it for abandoned.
+grace_wait() {
+  [ "$WAKEGUARD_GRACE_SECONDS" -ne 0 ] || return 0
+  sleep "$WAKEGUARD_GRACE_SECONDS"
+}
+
 cmd_stop() {
-  local key="$1" prompt_id="$2" pidfile
+  local key="$1" prompt_id="$2" pidfile recorded
   pidfile="$(pidfile_path "$key")"
 
+  recorded="$(cat "$pidfile" 2>/dev/null)"
+  grace_wait
   acquire_lock "$key" "$LOCK_WAIT_SECONDS" ||
     { log "stop $key: the lock stayed taken, leaving the holder to end and reap"; return 0; }
 
   if ! read_pidfile "$pidfile"; then
     log "stop $key: no holder pid recorded"
     rm -f "$pidfile" 2>/dev/null || true
+    return 0
+  fi
+  # Whoever wrote the pidfile while this run waited holds what it names now, and
+  # a subagent's stop has no turn id to work that out with.
+  if [ "$recorded" != "$(cat "$pidfile" 2>/dev/null)" ]; then
+    log "stop $key: the holder was taken over while this run waited, leaving it"
     return 0
   fi
   # Hooks reach here out of order, so a mismatch means a later turn already took
